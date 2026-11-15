@@ -131,7 +131,7 @@ __global__ void kv_write_sets_kernel(KvSets a, const int* count, const int* pos0
 // and kv_write (warp 1) of row b; [rows, 2 rows): compressor emit and carry of row b - rows (kv-source
 // layers); then 8 CTAs of 4 warps for the indexer's 32 head weights (index layers). Norm and projection
 // weights load before the PDL wait. k16: 9..16 rows, the head weights in two groups (rows 0..7, then the rest).
-template <bool k16>
+template <bool kPaged, bool k16>
 __global__ void __launch_bounds__(128) decode_prep_kernel(DecodePrep a, int rows) {
   pdl_trigger();
   int b = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -178,8 +178,8 @@ __global__ void __launch_bounds__(128) decode_prep_kernel(DecodePrep a, int rows
         prefetch_l2(reinterpret_cast<const uint8_t*>(a.cw.wk) + 128 * i);
       pdl_wait();
       const CompressorCarry carry = carry_at(a.carry, b);
-      emit_row(b, b > 0 && same_session(a.carry.slot, b - 1, b), a.ckv_proj, a.cscore, a.pos, a.cw, carry, a.table,
-               ckv_at(a.ckv, b), ik_at(a.ik, b), nullptr, 0);
+      emit_row<kPaged>(b, b > 0 && same_session(a.carry.slot, b - 1, b), a.ckv_proj, a.cscore, a.pos, a.cw, carry,
+                       a.table, ckv_at(a.ckv, b), ik_at(a.ik, b), nullptr, 0);
       if (a.cw.ratio > 1) carry_row(b, a.ckv_proj, a.cscore, a.pos, carry);
       return;
     }
@@ -232,15 +232,22 @@ void decode_prep(const DecodePrep& a, int rows, bool pdl, cudaStream_t s) {
   if (rows < 1 || rows > kMaxDecodeRows) die("decode_prep: %d rows", rows);
   // At most kDecodeGroup rows a session (attn.h DecodePrep: 16 would race on the carry). Without a table, the rows
   // are one session; with one, its builder checks.
-  if (rows > kDecodeGroup && !(a.win.slot || a.carry.slot || a.ckv.slot || a.ik.slot))
+  if (rows > kDecodeGroup && !(a.win.slot || a.carry.slot || a.ckv.slot || a.ik.slot || a.ckv.pages.slot ||
+                               a.ik.pages.slot))
     die("decode_prep: %d rows of one session, at most %d", rows, kDecodeGroup);
   check_slots(a.win, "decode_prep");
   check_slots(a.carry, "decode_prep");
   check_slots(a.ckv, "decode_prep");
   check_slots(a.ik, "decode_prep");
+  if (a.ckv.pages.paged() != a.ik.pages.paged()) die("decode_prep: pages on one cache and not the other");
+  const bool paged = a.ckv.pages.paged();
   int grid = rows + (a.ckv_proj ? rows : 0) + (a.wproj ? kIdxHeads / 4 : 0);
-  launch(rows > kDecodeGroup ? decode_prep_kernel<true> : decode_prep_kernel<false>, dim3(grid), dim3(128), 0, s, pdl,
-         a, rows);
+  if (rows > kDecodeGroup)
+    launch(paged ? decode_prep_kernel<true, true> : decode_prep_kernel<false, true>, dim3(grid), dim3(128), 0, s, pdl,
+           a, rows);
+  else
+    launch(paged ? decode_prep_kernel<true, false> : decode_prep_kernel<false, false>, dim3(grid), dim3(128), 0, s,
+           pdl, a, rows);
 }
 
 }  // namespace attn

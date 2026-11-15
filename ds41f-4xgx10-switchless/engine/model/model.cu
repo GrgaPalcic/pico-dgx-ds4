@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -27,17 +28,60 @@ namespace {
 
 // Bench only (Model::set_route_shift): row blockIdx.x's router logits [kExperts] rotated by
 // shift * (row / group).
-// DIAGNOSTICS (DSGB10_ROUTE_DUMP=FILE, rank 0): layer L's routed experts of every row into a ring by step,
-// with the step's rows, slots and positions; the host appends each finished step to FILE (wait()).
-__global__ void k_route_copy(const int* ridx, const ops::StepIn* in, int L, RouteRec* ring) {
+// DIAGNOSTICS (DSGB10_ROUTE_DUMP=FILE, rank 0): layer L's routed experts of every row, and each row's top-12
+// router picks with their selection keys, into a ring by step; the host appends each finished step to FILE
+// (wait()). Two blocks of 1024: one warp a row (kMaxRows rows at most). A warp's keys are router_row's
+// exactly: sqrtf(l > 20 ? l : log1pf(expf(l))) + bias over every expert, top 12 descending, ties to the lower
+// id. The first block also copies the step's routed experts, slots and positions, as before.
+__global__ void k_route_copy(const int* ridx, const ops::StepIn* in, int L, RouteRec* ring, const float* gl,
+                             const float* bias) {
   RouteRec& rr = ring[in->step % kRouteRing];
   const int R = in->rows < kMaxRows ? in->rows : kMaxRows;
-  for (int i = threadIdx.x; i < R * kTopK; i += blockDim.x) rr.e[L][i / kTopK][i % kTopK] = (int16_t)ridx[i];
-  if (L == 0 && threadIdx.x < kMaxRows) {
-    rr.slot[threadIdx.x] = in->slot[threadIdx.x], rr.pos[threadIdx.x] = in->pos[threadIdx.x];
-    if (threadIdx.x == 0) rr.R = R, rr.step = in->step;
+  if (blockIdx.x == 0) {
+    for (int i = threadIdx.x; i < R * kTopK; i += blockDim.x) rr.e[L][i / kTopK][i % kTopK] = (int16_t)ridx[i];
+    if (L == 0 && threadIdx.x < kMaxRows) {
+      rr.slot[threadIdx.x] = in->slot[threadIdx.x], rr.pos[threadIdx.x] = in->pos[threadIdx.x];
+      if (threadIdx.x == 0) rr.R = R, rr.step = in->step;
+    }
+  }
+  const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (row >= R) return;
+  constexpr int kPer = kExperts / 32;
+  const int lane = threadIdx.x & 31;
+  const float* l = gl + (size_t)row * kExperts;
+  float key[kPer];
+#pragma unroll
+  for (int j = 0; j < kPer; ++j) {
+    const int e = lane + 32 * j;
+    const float v = __ldcg(l + e);
+    key[j] = sqrtf(v > 20.f ? v : log1pf(expf(v))) + __ldg(bias + e);
+  }
+#pragma unroll
+  for (int k = 0; k < kRouteTop; ++k) {  // the warp's best key, its expert id; bv and be come out uniform
+    float bv = -INFINITY;
+    int bj = 0;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j)
+      if (key[j] > bv) bv = key[j], bj = j;
+    int be = lane + 32 * bj;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+      const int oe = __shfl_xor_sync(0xffffffffu, be, o);
+      if (ov > bv || (ov == bv && oe < be)) bv = ov, be = oe;
+    }
+    if (lane == k) rr.top_id[L][row][k] = (int16_t)be, rr.top_sc[L][row][k] = bv;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j)
+      if (lane + 32 * j == be) key[j] = -INFINITY;
   }
 }
+
+// The host's record of a finished step (wait()): little-endian, magic "RTD2", step, R, the append's
+// CLOCK_REALTIME ns, then slot[R], pos[R], e[kLayers][R][kTopK], top_id[kLayers][R][kRouteTop] and
+// top_sc[kLayers][R][kRouteTop]. engine/server/tools/route_read.py reads it.
+constexpr char kRouteMagic[4] = {'R', 'T', 'D', '2'};
+constexpr size_t kRouteHdr = 4 + 4 + 4 + 8;  // magic, step, R, t_ns
 
 __global__ void route_rotate(float* gl, int shift, int group) {
   __shared__ float s[kExperts];
@@ -50,12 +94,18 @@ __global__ void route_rotate(float* gl, int shift, int group) {
 ops::StepSamp samp_of(const Sampling& s) { return ops::StepSamp{s.seed, s.temperature, s.top_p, s.top_k, s.n_top}; }
 
 // night (technique 5): at 9..16 rows the normed GEMVs' prologue (every CTA normalising all rows) made wq_b,
-// wq_a+wkv and the gate run at 50-150 GB/s; one rmsnorm launch, then the plain r16 GEMVs, gives the same bits
-// (test_kernels rows16 checks fused == unfused). DSGB10_FUSED16=1 restores the fused prologues.
+// wq_a+wkv and the gate run at 50-150 GB/s; one rmsnorm launch, then the plain r16 GEMVs, keeps that speed.
+// The norm takes the fused prologue's block size (norm_block) so that rmsnorm_scale partitions the sum of
+// squares as the prologue does: the two reductions are the same tree and give the same bits.
+// DSGB10_FUSED16=1 restores the fused prologues.
 bool unfused16() {
   static const bool u = !(getenv("DSGB10_FUSED16") && atoi(getenv("DSGB10_FUSED16")));
   return u;
 }
+
+// The fused prologue's block size (gemv_fp8.cu, gemv16.cu: dim3(32 * wn * wk)): the standalone norm that
+// replaces the prologue must reduce with the same thread count.
+int norm_block(const dsk::GemvCfg& c) { return 32 * c.wn * c.wk; }
 
 }  // namespace
 
@@ -77,6 +127,13 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
   const int R = kMaxRows;
   if (opt.slots < 1 || opt.slots > kMaxSlots) die("model: %d session slots (1..%d)", opt.slots, kMaxSlots);
   nslots = opt.slots;
+  shared_kv = opt.shared_kv;
+  max_pages = max_pages_of(opt.max_ctx);
+  if (shared_kv && opt.big_slots > 0)
+    die("model: --shared-kv with --big-slots %d: every slot holds the whole context", opt.big_slots);
+  // --shared-kv: the slot table is device data the step graphs read, and serve captures them before the
+  // pool exists, so it is made here (rows null until the pool's reserve writes them)
+  if (shared_kv) slot_tab = dalloc<uint64_t>((size_t)nslots * max_pages);
   // big slots (Options::big_slots): kUnitMul units each, the small ones one unit of max_ctx / kUnitMul
   const int nbig = opt.big_slots > 0 && opt.big_slots < nslots ? opt.big_slots : nslots;
   const int mul = nbig < nslots ? kUnitMul : 1;
@@ -97,10 +154,14 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
   for (int L : {2, 8, 14, 20}) {
     KvSrc& k = kvs0[kv_slot(L)];
     k.cap = unit_ctx / ratio_of(L) + 64;  // a big slot: kUnitMul of these end to end (>= max_ctx / ratio + 64)
-    k.ckv = dalloc<uint8_t>(nunits * k.ckv_stride());
-    k.csc = dalloc<uint8_t>(nunits * k.csc_stride());
-    k.ik = dalloc<uint8_t>(nunits * k.ik_stride());
-    k.iksc = dalloc<uint8_t>(nunits * k.iksc_stride());
+    if (shared_kv) {  // the pool's pages hold the caches and the keys
+      k.ckv = k.csc = k.ik = k.iksc = nullptr;
+    } else {
+      k.ckv = dalloc<uint8_t>(nunits * k.ckv_stride());
+      k.csc = dalloc<uint8_t>(nunits * k.csc_stride());
+      k.ik = dalloc<uint8_t>(nunits * k.ik_stride());
+      k.iksc = dalloc<uint8_t>(nunits * k.iksc_stride());
+    }
     k.carry_kv = dalloc<float>(nunits * KvSrc::kCarryStride);
     k.carry_sc = dalloc<float>(nunits * KvSrc::kCarryStride);
   }
@@ -435,7 +496,75 @@ void Model::Impl::use_slot(int s) {
   cur_slot = s, cur_unit = u;
   for (int L = 0; L < kLayers; ++L) ring_kv[L] = ring_kv0[L] + u * kRingKvBytes, ring_sc[L] = ring_sc0[L] + u * kRingScBytes;
   for (int k = 0; k < kKvSlots; ++k) kvs[k] = kvs0[k].at(u);
+  if (shared_kv)  // the eager paths read slot s's row (§2.3); the row itself is a slot take's (state_slot_row)
+    for (int k = 0; k < kKvSlots; ++k) kvs[k].pages = page_view(k, s);
   spec_use_slot(u);  // the draft module's windows, once bound
+}
+
+// The slot table's view of kv source k: slot s's row, or every row for a step (s < 0, the rows' slots
+// come from in_d->slot). The offsets are source k's own inside a page (page_off: the sources lie one
+// after another, and a ratio-2 source's page holds half the entries of a ratio-1 source's).
+attn::KvPages Model::Impl::page_view(int k, int s) const {
+  attn::KvPages p{};
+  const int ratio = k < 3 ? 2 : 1;
+  p.tab = slot_tab ? slot_tab + (s < 0 ? 0 : (size_t)s * max_pages) : nullptr;
+  p.slot = s < 0 ? in_d->slot : nullptr;
+  p.stride = (uint32_t)max_pages;
+  for (int a = 0; a < 4; ++a) p.off[a] = (uint32_t)page_off(k, a);
+  p.shift = ratio == 1 ? kPageShift : kPageShift - 1;
+  return p;
+}
+
+// Room for the session live in slot s up to `upto` positions (§2.5): its pages, from the pool,
+// evicting the store's least recently used stored session when it has none. False: no room and nothing
+// to evict; the caller must not launch.
+bool Model::Impl::shared_kv_room(int s, int upto) {
+  if (!shared_kv) return true;
+  if (s < 0 || s >= nslots) die("model: slot %d of %d", s, nslots);
+  const int h = slot_sess.of(s);
+  if (!h) die("model: slot %d has no session to hold its pages (state_slot_row first)", s);
+  return session_room(h, upto);
+}
+
+// The same for each row's slot (a step's rows, `pos[r] + 1` positions each): the sessions' pages,
+// allocated now. False: the pool has no room and nothing can be evicted.
+bool Model::Impl::shared_kv_room(const int* slot, const int* pos, int rows) {
+  if (!shared_kv) return true;
+  for (int r = 0; r < rows; ++r)
+    if (!shared_kv_room(slot[r], pos[r] + 1)) return false;
+  return true;
+}
+
+// Room for session h up to `upto` positions, live in a slot or stored (the store's least recently used
+// stored session is evicted when the pool has none). The pages the session's live slot's row gained are
+// written entry by entry.
+bool Model::Impl::session_room(int h, int upto) {
+  Store& store = store_of();
+  const auto it = store.sess.find(h);
+  if (it != store.sess.end() && it->second.disk) die("model: session %d is on disk and needs pages", h);
+  Store::Sess& ss = store.use(h);
+  const int have = (int)ss.pages.size();
+  const auto evict = [this, h] {
+    const int victim = evictable(h);
+    if (victim < 0) return false;
+    state_spill(victim);
+    return true;
+  };
+  // the copy-on-write spare first (SharedKv::spare): a copy took it, so a page comes back before anything grows
+  while (!store.kv.spare) {
+    store.kv.spare = store.kv.pool.take(kPageBytes);
+    if (!store.kv.spare && !evict()) return false;
+  }
+  if (!store.kv.room(ss.pages, store.bytes, upto, evict)) return false;
+  const int s = slot_of(h);
+  if (s < 0) return true;  // stored: the row is the slot's, written when a session takes it
+  if (store.kv.held[s] != have) store.kv.list(s, have, ss.pages.data());  // the row's image, if it drifted
+  for (int i = have; i < (int)ss.pages.size(); ++i) {
+    const int e = store.kv.add(s, ss.pages[i]);
+    CUDA_CHECK(cudaMemcpyAsync(slot_tab + (size_t)s * max_pages + e, store.kv.row(s) + e, sizeof(uint64_t),
+                               cudaMemcpyHostToDevice, st));
+  }
+  return true;
 }
 
 attn::Window Model::Impl::step_win(int L) const {
@@ -446,13 +575,15 @@ attn::Window Model::Impl::step_win(int L) const {
 
 attn::Compressed Model::Impl::step_ckv(int k) const {
   attn::Compressed c = kvs0[k].compressed();
-  if (nunits > 1) c.slot = in_d->slot, c.kv_stride = kvs0[k].ckv_stride(), c.sc_stride = kvs0[k].csc_stride();
+  if (shared_kv) c.pages = page_view(k, -1);
+  else if (nunits > 1) c.slot = in_d->slot, c.kv_stride = kvs0[k].ckv_stride(), c.sc_stride = kvs0[k].csc_stride();
   return c;
 }
 
 attn::IndexKeys Model::Impl::step_keys(int k) const {
   attn::IndexKeys ik = kvs0[k].keys();
-  if (nunits > 1) ik.slot = in_d->slot, ik.k_stride = kvs0[k].ik_stride(), ik.sc_stride = kvs0[k].iksc_stride();
+  if (shared_kv) ik.pages = page_view(k, -1);
+  else if (nunits > 1) ik.slot = in_d->slot, ik.k_stride = kvs0[k].ik_stride(), ik.sc_stride = kvs0[k].iksc_stride();
   return ik;
 }
 
@@ -541,6 +672,7 @@ void Model::Impl::indexer(int L, int R, int ctx) {
     const int m = std::min(kDecodeRows, R - r0);
     attn::IndexKeys ik = ik0;
     if (ik.slot) ik.slot += r0;
+    if (ik.pages.slot) ik.pages.slot += r0;  // --shared-kv: the group's rows' slots, as the contiguous table's
     const attn::IndexSel top{kIdxTopk, topk[slot] + (size_t)r0 * kIdxTopk, topkey[slot] + (size_t)r0 * kIdxTopk, kIdxTopk};
     const uint16_t* iq = U(iqpre) + (size_t)r0 * kIdxQ;
     const float* wp = wproj + (size_t)r0 * kIdxHeads;
@@ -586,8 +718,8 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
   if (wide) {
     dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st);
     dsk::gemm_fp8_p(yq, ys, R, seg, 2, kDim, st);
-  } else if (R > dsk::kLowRows && unfused16()) {  // night: 9..16 rows: norm once, then the plain r16 GEMV (same bits)
-    dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st);
+  } else if (R > dsk::kLowRows && unfused16()) {  // night: 9..16 rows: norm once, then the plain r16 GEMV
+    dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st, norm_block(c8k));
     dsk::gemv_fp8_multi(yq, ys, R, seg, 2, kDim, c8k, st);  // c8k: the fused call's split-K, same bits
   } else {
     dsk::gemv_fp8_norm(yraw, w.attn_norm, kNormEps, R, seg, 2, kDim, c8k, st, y);
@@ -625,6 +757,8 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
       if (ca.slot) ca.slot += r0;
       if (cc.slot) cc.slot += r0;
       if (ck.slot) ck.slot += r0;
+      if (cc.pages.slot) cc.pages.slot += r0;  // --shared-kv: the group's rows' slots
+      if (ck.pages.slot) ck.pages.slot += r0;
       attn::compressor_emit(ckvf + (size_t)r0 * kHead, cscf + (size_t)r0 * kHead, pos_d + r0, std::min(kDecodeRows, R - r0),
                             cw, ca, rope_yarn, cc, ck, nullptr, 0, sb, R > kDecodeRows ? &in_d->rows : nullptr, r0);
     }
@@ -634,7 +768,7 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
     dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st);
     dsk::gemm_fp8_p(oq, os, R, qseg, idx_src(L) ? 2 : 1, kQLora, st);
   } else if (R > dsk::kLowRows && unfused16()) {  // night: wq_b's input normed once (oq/os are free until wo_a)
-    dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st);  // o: scratch for the bf16 copy
+    dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st, norm_block(c8k));  // o: scratch for the bf16 copy
     dsk::gemv_fp8_multi(oq, os, R, qseg, idx_src(L) ? 2 : 1, kQLora, c8k, st);
   } else {
     dsk::gemv_fp8_norm(qa, w.q_norm, kNormEps, R, qseg, idx_src(L) ? 2 : 1, kQLora, c8k, st);
@@ -717,7 +851,7 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
     dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st);
     dsk::gemm_bf16_p(y, R, w.gate, kExperts, kDim, gl, st);
   } else if (R > dsk::kLowRows && unfused16()) {  // night: the gate on the normed rows (y is free after the attention)
-    dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st);
+    dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st, norm_block(cgate));
     dsk::gemv_bf16(y, R, w.gate, kExperts, kDim, gl, nullptr, cgate, false, st);
   } else {
     dsk::gemv_bf16_norm(yraw, w.ffn_norm, kNormEps, R, w.gate, kExperts, kDim, gl, nullptr, cgate, st, yq, ys);
@@ -742,7 +876,7 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
     mc.down = R == 1 ? 2 : 4;
     dsk::moe_routed(yq, ys, R, gl, w.gate_bias, kExperts, kRouteScale, w.moe, moe_ws, ymoe, mc, st, ridx, rwts);
   }
-  if (route_ring) k_route_copy<<<1, 128, 0, st>>>(ridx, in_d, L, route_ring);
+  if (route_ring) k_route_copy<<<(kMaxRows + 31) / 32, 1024, 0, st>>>(ridx, in_d, L, route_ring, gl, w.gate_bias);
   l2pf(1, L + 1, R);
   join(sa);  // the mixes
   // the experts' partial sums all-reduced, hc_post into the next block's input, and its collapse
@@ -931,9 +1065,43 @@ const ops::SampleOut& Model::Impl::wait(uint64_t n) {
   n_done = std::max(n_done, n + 1);
   last_n = n;
   if (route_f) {
-    RouteRec r;
-    CUDA_CHECK(cudaMemcpy(&r, route_ring + n % kRouteRing, sizeof r, cudaMemcpyDeviceToHost));
-    if (r.step == (uint32_t)n) fwrite(&r, sizeof r, 1, route_f), fflush(route_f);
+    const RouteRec* r = route_ring + n % kRouteRing;
+    uint32_t step = 0;
+    int32_t R = 0;
+    CUDA_CHECK(cudaMemcpy(&step, &r->step, 4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&R, &r->R, 4, cudaMemcpyDeviceToHost));
+    if (step == (uint32_t)n && R > 0) {  // a prefill step (and an overwritten one) leaves nothing
+      R = std::min<int>(R, kMaxRows);
+      const size_t per_e = (size_t)R * kTopK * 2, per_id = (size_t)R * kRouteTop * 2;
+      const size_t per_sc = (size_t)R * kRouteTop * 4;
+      const size_t off_e = kRouteHdr + 2 * (size_t)R * 4, off_id = off_e + (size_t)kLayers * per_e;
+      const size_t off_sc = off_id + (size_t)kLayers * per_id;
+      std::vector<uint8_t> rec(off_sc + (size_t)kLayers * per_sc);
+      // layers the run does not cover wrote nothing for this step: -1 and NaN (RouteRec)
+      int16_t* he = reinterpret_cast<int16_t*>(rec.data() + off_e);
+      int16_t* hid = reinterpret_cast<int16_t*>(rec.data() + off_id);
+      float* hsc = reinterpret_cast<float*>(rec.data() + off_sc);
+      for (size_t i = 0; i < (size_t)kLayers * R * kTopK; ++i) he[i] = -1;
+      for (size_t i = 0; i < (size_t)kLayers * R * kRouteTop; ++i) hid[i] = -1, hsc[i] = NAN;
+      timespec ts;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      const uint64_t t_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+      std::memcpy(rec.data(), kRouteMagic, 4);
+      std::memcpy(rec.data() + 4, &step, 4);
+      std::memcpy(rec.data() + 8, &R, 4);
+      std::memcpy(rec.data() + 12, &t_ns, 8);
+      CUDA_CHECK(cudaMemcpy(rec.data() + kRouteHdr, &r->slot, 2 * (size_t)R * 4, cudaMemcpyDeviceToHost));
+      const int lo = std::max(0, opt.first_layer), hi = std::min(kLayers, opt.n_layers);
+      if (hi > lo) {  // the layers' rows, one strided copy a field (the ring holds kMaxRows rows of each)
+        CUDA_CHECK(cudaMemcpy2D(rec.data() + off_e + (size_t)lo * per_e, per_e, r->e[lo],
+                                (size_t)kMaxRows * kTopK * 2, per_e, hi - lo, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy2D(rec.data() + off_id + (size_t)lo * per_id, per_id, r->top_id[lo],
+                                (size_t)kMaxRows * kRouteTop * 2, per_id, hi - lo, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy2D(rec.data() + off_sc + (size_t)lo * per_sc, per_sc, r->top_sc[lo],
+                                (size_t)kMaxRows * kRouteTop * 4, per_sc, hi - lo, cudaMemcpyDeviceToHost));
+      }
+      std::fwrite(rec.data(), 1, rec.size(), route_f), std::fflush(route_f);
+    }
   }
   return o;
 }
@@ -1216,6 +1384,7 @@ size_t Model::code_head(int* raw_tiles) { return d_->code_head(raw_tiles); }
 void Model::use_slot(int s) { d_->use_slot(s); }
 int Model::slot() const { return d_->cur_slot; }
 int Model::slots() const { return d_->nslots; }
+bool Model::shared_kv() const { return d_->shared_kv; }
 int Model::slot_ctx(int s) const { return d_->slot_ctx_[s]; }
 void Model::set_engram(const engram::HashMap* map, engram::Store* store) {
   d_->emap = map;
@@ -1236,6 +1405,13 @@ void Model::step(const Ctl& c, int32_t* sampled, Sink* sink) {
   Sampling sp;
   sp.temperature = c.temperature;
   sp.seed = c.seed;
+  // --shared-kv: an eager step's pages, allocated before its launch (docs/shared-kv.md §2.5). The modes
+  // (main.cpp's golden and bench loops, cmd.cpp's follow) reach their steps here; the server's loops do
+  // their own room calls. The modes size the pool for the run, so a full one is an error of the run.
+  // shared_kv_room is a constant true with the flag off.
+  if (!d_->shared_kv_room(d_->cur_slot, c.pos0 + c.rows))
+    die("model: step at %d of session %d without its page (the shared KV pool is full)", c.pos0,
+        d_->slot_sess.of(d_->cur_slot));
   const SampleOut& o = d_->wait(d_->launch(c.rows, c.pos0, c.tokens, sp, c.flags, sink));
   for (int r = 0; r < c.rows; ++r) sampled[r] = o.row[r].token;
 }

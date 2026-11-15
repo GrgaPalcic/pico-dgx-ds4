@@ -105,8 +105,18 @@ GB10's 128 GB of LPDDR5X is shared by CPU and GPU (121 GiB visible). With `--max
 | ring region | 48 MiB | pinned host memory, 12 × `--ring-cap` (default 4 MiB) |
 | DSpark blocks `mtp.*` | 2.0 GB | with drafts (serve's default; [Drafts](#drafts-dspark)); plus 16 MB for their mHC projections and router rows whole, and 165 MB for the FP8 copy of the head (serve's default) |
 | spec step graph | 0.24 GiB | one for every context (index_dense reads the scan's length from the positions), captured at startup: its conditional bodies (8 row counts) live in device memory. It was one per 4096-position context bucket, ~210 MiB each: 3.33 GiB at 65536, about 13 GiB at 262144 |
-| session store | 12 GiB | serve: one pool reserved at startup, the same size on every rank (`--session-gib`, [Serving](#serving)) |
+| session store | 12 GiB | serve: one pool reserved at startup, the same size on every rank (`--session-gib`, [Serving](#serving)); with `--shared-kv` it is the store plus what the slots would have reserved |
 | the store's disk tier | 528 MiB | serve: pinned host memory, 512 MiB of staging for spills in flight and two 8 MiB read buffers |
+
+With `--shared-kv` ([shared-kv.md](shared-kv.md)) the compressed caches, the index keys and the store's
+pages are one pool: a live slot keeps only its window rings and carries (5.4 MB, whatever the context)
+besides the drafter's windows, and a session takes or leaves a slot by pointing a table at its pages.
+The pool's cap is `--session-gib` (12 GiB by default) plus what `--slots` would have reserved for the
+caches at `--max-ctx` — at `--slots 16 --max-ctx 1048576`, 12 + 16 × 895.4 MiB ≈ 26.0 GiB, the same
+total KV memory as flag off besides the flag's own blocks — or an explicit `--session-gib` as it is
+given, and every rank takes the smallest offer as above; `--big-slots` is refused, every slot holding
+the whole context. Rank 0 logs the rule as `shared KV: …` after the store's line
+([Serving](#serving)).
 
 Each process holds 71.1 GiB of GPU memory once its graphs exist (`nvidia-smi`: 72,830 MiB). Context
 costs little memory: about 890 B per position for all 40 layers, since the four compressed caches
@@ -498,14 +508,33 @@ requests and one snapshot skipped, every comparison but one equal, and the two f
 short fork's, whose base had been evicted, so it ran cold (same tokens, `cached` 0, a cold CED
 prefill's log-probability); at the defaults it passes 17 of 17, and `--exact` 9 of 9.
 
+**`--shared-kv`** ([shared-kv.md](shared-kv.md)) makes that pool the sessions' pages, the slot table
+and the zero page at once: a slot's compressed caches and index keys are not allocated, a session
+takes or leaves a slot by pointing its row at its pages (no copy), and a live session is never
+spilled (its pages are its state; a session that must be spilled first lets its slot go). The cap is
+`--session-gib` plus what `--slots` would have reserved at `--max-ctx`, or an explicit
+`--session-gib` as given, bounded by the ranks' offers; at `--slots 16 --max-ctx 1048576` the rule is
+12.00 + 16 × 895.4 MiB ≈ 26.0 GiB, 7,604 pages (31,145,984 positions) when the offers allow it, and
+rank 0 logs it:
+
+    shared KV: 26.00 GiB on every rank (at most 12.00 + the slots' 13.99; 7604 pages of 3.5 MiB, 31145984
+    positions; 16 slot rows of 257, and one 3.5 MiB zero page)
+
+A step or a chunk the pool cannot hold is never launched: the request ends with DONE reason `kError`
+and the text `the shared KV pool is full (…)`, which dsfront reports as any engine error (HTTP 500, or
+a streaming request's last event), the tokens already sent standing and the session's state consistent
+at its last written position — never a crash and never a silent short write.
+
 **The disk tier.** A session that leaves the store is spilled to disk rather than freed (unless
 `--disk-gib 0`). Each rank writes its own slice to its own disk: `rank<r>.spill` in `--disk-dir`,
 by default the fleet file's `RANK<r>_SPILL`: `/data/dsgb10/spill` on rank 0 (its USB4 SSD) and `~/dsgb10/spill` on the others (NVMe).
-- At startup each rank removes any earlier file and offers its free space less 32 GiB, at most
-  `--disk-gib` (default 32). Every rank makes a file of the smallest offer (none under 1 GiB) with
-  `posix_fallocate`, opened `O_DIRECT`, mode 0600 in a directory of mode 0700. The file is removed
-  at exit, unless a planned stop keeps it, with its sessions, for the next start, which then opens it
-  as it is ([Kept sessions](#kept-sessions)).
+- At startup each rank offers its free space less 32 GiB, at most `--disk-gib` (default 32), and reads
+  its own index files (`rank<r>.<tag>.d/<h>.<seq>.c`, one per session per rank: see **Durable copies**
+  below). When every rank's spill file is the same size, that size is at most every offer and one index
+  file is of this run, every rank opens its file as it is and the copies it names come back; anything
+  else starts clean and removes the file, the index files and the legacy `rank<r>.<tag>.index`. A file
+  is made with `posix_fallocate`, opened `O_DIRECT`, mode 0600 in a directory of mode 0700, and removed
+  at exit unless a copy names it (a planned stop, or a start that reused one).
   On 2026-10-12 the boxes had 209 GiB, 178 GiB, 1.3 TiB and 831 GiB free, so the cap could go to
   about 145 GiB.
   32 GiB holds about 170 thinned sessions of 128k, or 110 of 250k.
@@ -516,6 +545,58 @@ by default the fleet file's `RANK<r>_SPILL`: `/data/dsgb10/spill` on rank 0 (its
   model's stream, after whatever wrote the block, and frees the block in the store at once. A writer
   thread waits for the copies' event and writes them out. A spill waits for the disk only when the
   staging is full.
+- **The writer is pinned.** `SpillFile::writer` (spill.cpp) pins its thread to `DSGB10_SPILL_CPU`
+  (default 13, an A725 efficiency core of the GB10; a negative value: not pinned) with
+  `pthread_setaffinity_np`, so the file's I/O does not fight a decode step for a core. It logs one
+  line at startup: `spill: writer on CPU 13`, or `spill: writer not pinned` (with the reason) when the
+  pin fails, and goes on unpinned.
+- **Durable copies.** Every finished turn is written through to a complete copy of its session in the
+  file, named by one small index file per session per rank: `<base>.d/<h>.<seq>.c`. A copy holds the
+  session's pages, its window snapshots and its end block, each with the checksum it went out with; the
+  index file goes behind them in the writer's queue (the writer `fdatasync`s the file first), so a crash
+  leaves the old copy whole and the new one absent. `state_copy` writes one when a request ends
+  (`serve.cpp`'s finish path, one state operation) and `state_inval` says what a restart rewrites; a
+  session that is spilled has no copy of its own to make, its copy *is* the session.
+  - **Recovery.** At a start the index files are read (magic, run id, rank, the layout's byte sizes, the
+    file's size, the body's hash, every offset on the grain and inside the file, `now − written ≤
+    --keep-days`), what fails is removed, the ranks intersect the `(h, seq)` pairs they have (counts,
+    then a padded fixed-size array) and keep the highest `seq` for each `h`; every other index file goes.
+    The sessions come back as spilled ones and rank 0's server reads their histories back with them
+    (`load_recovered`). Above 262,144 pairs on a rank it logs and starts clean.
+  - **A rebuild or a flag change starts empty.** The run id is a hash of the binary's bytes, of the
+    weights' and the Engram files' paths, sizes and times, and of the options that change what a request
+    computes (`--max-ctx`, `--exact`, drafts, the drafter head's FP8, `--prefill-rows`, `--small-rows`,
+    `--snap-every`, `--no-engram`, `--layers`, `--first`, `--ring-cap`, `--draft-head4`,
+    `--draft-markov8`, and `--shared-kv` when it is on). An index file of another run id is dropped.
+  - **A bad copy costs one crash, never a restart loop.** A block of a session read back from the disk
+    that differs from the checksum it went out with removes that session's index file and stops the
+    engine: the next start drops the session rather than looping on it.
+  - **The writer's fault injection.** `DSGB10_COPY_FAULT=N` (test only): the writer exits before writing
+    the index file of copy `N`, as a crash between a copy's blocks and its index does. The next start
+    then has copy `N − 1` and the turns after it are lost.
+  - **`DSGB10_COPY=0`** (measurement only): no finished turn is written through and a planned stop keeps
+    nothing. The copies are the tier's write traffic, and this is the baseline without them
+    (`ms-copy` against `ms-nocopy`).
+  - **What the server writes beside them.** Each session's history (its token ids, its restart ranges
+    and when it was last used) is one file of its own in `server.<tag>.d`, written after the engine's
+    copy and removed with it, so a start keeps only the histories whose copy it recovered. `--keep-days`
+    (7) is the age limit for both.
+- **Counters.** `--stats-file FILE` (serve; rank 0 writes, the other ranks ignore it) appends one JSON
+  line every 600 s when a counter changed since the last line, and once at a planned stop:
+  `{"t", "sessions", "pool_gib", "pool_cap_gib", "disk_gib", "disk_cap_gib", "spills", "spill_bytes",
+  "unspills", "unspill_bytes", "disk_drops", "kept_loaded", "cow", "copies", "copy_bytes", "recovered",
+  "frees_no_disk"}`. `spills` and `spill_bytes` count the sessions spilled to the tier and their bytes,
+  `unspills` and `unspill_bytes` those read back, `disk_drops` the sessions dropped from a full file to
+  make room, `kept_loaded` and `recovered` the sessions a start took back from the index files, `cow` the
+  copy-on-write page copies (`--shared-kv`), `copies` the finished turns written through and
+  `copy_bytes` the blocks they wrote, and `frees_no_disk` the sessions `evict()` freed because there is
+  no tier. `sessions` is what the server holds; the four sizes are GiB with 3 decimals; the counters are
+  as counted. The file is opened `O_APPEND|O_CREAT`, mode 0600.
+- **What the tier can serve is dsfront's table.** A session the tier keeps needs its dsfront entry:
+  the front-end's table holds `--table-sessions` (256) sessions and `--table-tokens` (16777216) ids in
+  all, and drops the least recently used over either limit. Production runs `--disk-gib 200`, so size
+  `--table-sessions` and `--table-tokens` for the sessions the tier is to hold (a session of 128k
+  positions is about 100k ids), or the engine keeps sessions the front-end has long forgotten.
 - Eviction is otherwise unchanged. Between requests, the server spills least recently used sessions
   down to its budget (`serve: spill session …`). Inside a request, an allocation that finds the store
   full spills its victim.
@@ -623,7 +704,11 @@ the design, steps B1 and B2).
   its session's slot; else a free one; else the least recently used one whose session no request uses;
   else, with turns (below), the slot of the request whose turn comes last. The state of the session that
   held it goes to the store: its pages and an end snapshot, as a switch of the one live session did.
-  Every command pins the slots' sessions in the store.
+  Every command pins the slots' sessions in the store. With `--shared-kv` a slot keeps only its rings,
+  carries, table row and the drafter's windows (5.9 MiB at 1M), so every slot holds `--max-ctx`
+  positions whatever `--slots` is: a session never outgrows its slot, `--big-slots` is refused, the pool
+  is the only capacity limit (a request the pool cannot hold ends with the error of
+  [Serving](#serving)), and taking or leaving a slot copies no cache.
 - **Prefill first.** A request that comes while others decode pauses them at their next step, through
   the control word, if it can have a slot. It is prefilled whole and sends its first token; then it
   decodes with them. A request for a session in flight waits for that request's end, as before.
@@ -763,8 +848,8 @@ the lock for as long as it runs, so stop it when idle. Before it starts the rank
 `run4.sh` drops the model files' page cache on every box (`engine/server/tools/evict_cache.py`, given each rank's files from the fleet file; no root needed); a
 service start script (M9) has to run the same eviction first, or the free memory that sizes the
 session store can be a few GiB. `run4.sh stop` sends SIGTERM to rank 0 only and waits up to 30 s: a
-server ends the request in flight (its DONE is an error, "the server is stopping"), keeps its
-sessions for the next start when `--keep-gib` is above 0 ([Kept sessions](#kept-sessions)), sends
+server ends the request in flight (its DONE is an error, "the server is stopping"), writes every
+session's state through to the disk tier ([Kept sessions](#kept-sessions)), sends
 `kCmdStop`, and all four ranks leave the ring together; then whatever is still running on any box is
 killed. Killing a worker first
 failed the others in the middle of that (`socket read: peer closed`, a core dump, in every server log
@@ -790,6 +875,10 @@ python3 engine/server/tools/kprof.py /tmp/p.sqlite    # per step: each kernel cl
 python3 engine/server/tools/kwall.py /tmp/p.sqlite    # step walls; each collective's p10 / median / p90
 ```
 
+`engine/server/tools/prof.sh OUT ARGS...` runs that recipe for one bench (`run4.sh --mode bench ARGS` with rank 0 under nsys; the report stays in `OUT.nsys-rep` / `OUT.sqlite`).
+Its capture range is the first context's first k, from its 4th step: the one-session loop's replays, and for a k past `kMaxSessRows` (B4) the natural loop of the first `--bench-groups` run.
+The 16-row example: `engine/server/tools/prof.sh /tmp/b16 --golden G --max-ctx 266240 --slots 8 --ctx 32768 --steps 32 --bench-stride 4096 --ks 16 --bench-groups 2 --shared-kv`.
+
 Modes: `prefill` (the golden sequence in chunks of `--chunk` rows, every layer compared, logits at
 every position), `tf` (teacher-forced decode of `--k` rows after `--prompt` tokens), `generate`
 (`--gen` tokens, greedy or `--temp`/`--seed`), `bench` (`--ctx` positions of prefill, then `--steps`
@@ -806,6 +895,14 @@ a decode loop nsys's capture range ([specprof.py](../engine/server/tools/specpro
 draft pass by kernel). `--setenv NAME=VALUE` sets a variable in every rank's environment (experiments'
 knobs). `--layers N` / `--first N` run only blocks [first, N) (half-model tests with injection),
 `--no-graphs` runs every step eagerly, `--no-engram` skips the store.
+
+**Diagnostics (measurement only, test use).** `--setenv` is how these reach every rank. Two of them log
+the tokens a run computes, so they belong in test windows with synthetic or owner-approved prompts, never
+in production: `DSGB10_STEP_LOG=FILE` appends one JSON line per decode step, the batched loops' entries
+carrying the token ids they emitted (`"tok"`; the single-session speculative loop writes every row's
+sample, rejected rows included); `DSGB10_SUBMIT_LOG=FILE` (serve, rank 0) appends one line per request's
+first run, with its plan — session and base ids, slot, prompt length, restart point, cached count — and
+the prompt's full token ids. With neither variable set, every code path, log line and output is as before.
 
 ### As a service: service.sh
 
@@ -838,7 +935,7 @@ Settings come from the environment of `start`, which writes them to `run/setting
 | `MIN_AVAIL_GIB` | 100 GiB | the MemAvailable every box needs before the engine starts |
 | `DSGB10_YIELD_IDLE_S` | 600 s | the ring is lent to a job that waits for it once dsfront has had no request for this long ([Borrowing the ring](#borrowing-the-ring)) |
 | `DSGB10_HOLD_S` | 600 s | while the engine is down (lent, or restarting), dsfront holds a request this long, then answers 503 with `Retry-After: 60` |
-| `DSGB10_KEEP_GIB` | 4 | an engine stop (`stop`, `restart`, a lend) keeps the sessions for the next start: those in the disk tier, and those in device memory, the most recently used first, up to this many GiB written at the stop. 0: nothing is kept, nor taken back ([Kept sessions](#kept-sessions)) |
+| `DSGB10_COPY` | 1 | 0: no finished turn is written through to the disk tier and a stop keeps nothing (a measurement's baseline; the copies are the tier's write traffic, [Kept sessions](#kept-sessions)) |
 | `FLEET` | `fleet/homelab.conf` | the fleet file: the workers, the ring lock, `SERVICE_DIR` and each rank's files. It is read from the environment of every command, `stop` and `status` too, not from `run/settings`; `start` copies it beside the engine on every box as `bin/fleet.conf` |
 | `DSGB10_HOME`, `DSGB10_MOCK` | the fleet's `SERVICE_DIR` (`~/dsgb10/service`), 0 | a test instance: `DSGB10_MOCK=1` runs dsfront's mock engine in place of the four ranks, on rank 0 alone, and touches no rank, worker or page cache. It must have its own `DSGB10_HOME` and `RING_LOCK` (the script refuses otherwise) and a free port, set for every command, `stop` and `status` too |
 
@@ -883,9 +980,8 @@ What it does:
   - The engine's socket is `~/dsgb10/service/run/engine.sock`, mode 0600 in a 0700 directory. Nothing
     of the engine listens on a TCP port.
 - **Files.** On rank 0, `~/dsgb10/service/run` holds the state, settings, pids, the engine's socket
-  and dsfront's admin socket (`front.admin`), and between a stop and the next start dsfront's session
-  table (`front.table`). The kept sessions are in the engine's spill directory on every box
-  ([Kept sessions](#kept-sessions)).
+  and dsfront's admin socket (`front.admin`), and dsfront's session files (`front.d/`). The copies are in
+  the engine's spill directory on every box ([Kept sessions](#kept-sessions)).
   `~/dsgb10/service/logs` holds `service.log` (the supervisor: every start, exit, failure and state),
   `rank.0.log` and `front.log`; each worker has `logs/rank.<r>.log`. Every (re)start rotates its log,
   and on rank 0 a log past 64 MiB is rotated in place, copied and truncated (the processes append).
@@ -1157,108 +1253,133 @@ before `ring_run`):
 
 ### Kept sessions
 
-A planned stop of the engine keeps its sessions for the next start. After a lend, a `restart` or a
-deploy of the same build, a conversation's next turn finds its state on disk rather than prefilling
-the whole conversation again. A crash keeps nothing.
+Every finished turn leaves a complete, checksummed copy of its session on the SSD, so a `kill -9`, a
+watchdog restart or a power cut loses at most the turn in flight, and a conversation's next turn finds
+its state on disk rather than prefilling the whole conversation again. Nothing is written at a stop that
+a finished turn did not already write; a stop only makes what is still in device memory one too.
 
 ```
-engine/server/service.sh stop --forget                  # stop, then remove what stops kept, on every box, and dsfront's table
-engine/server/service.sh forget                         # the same while stopped (refused while it runs: its stop would keep them again)
-DSGB10_KEEP_GIB=0 engine/server/service.sh restart      # from then on nothing is kept, nor taken back
+engine/server/service.sh stop --forget                  # stop, then remove what the copies left, on every box, and dsfront's table
+engine/server/service.sh forget                         # the same while stopped (refused while it runs)
+DSGB10_COPY=0 engine/server/service.sh restart          # from then on nothing is written through, and a stop keeps nothing
 ```
 
-**The stop.** On SIGTERM (`service.sh stop` and `restart`, a lend, `run4.sh stop`), with `--keep-gib
-N` above 0 and a disk tier, rank 0's server ends the requests in flight (paused ones and those
-waiting for their turn too: "the server is stopping"), then:
+**A finished turn.** At the end of every request (unless `DSGB10_COPY=0`), rank 0's server moves the
+session's working state into the store, sends `kStCopy` (state.cu `state_copy`), and writes the
+session's history beside it:
+- `state_copy` writes the pages, the window snapshots and the end block that the session's last copy does
+  not already hold, each with its checksum taken on the device, and queues the index file
+  (`rank<r>.<tag>.d/<h>.<seq>.c`) behind them in the writer's queue. The writer `fdatasync`s the file and
+  then writes the index whole or not at all (keepfile.h), so an index never names a block that is not on
+  the disk and a crash leaves the old copy whole and the new one absent;
+- the server queues `<id 16 hex>.<h>.<seq>.s` in `server.<tag>.d`: the session's id, its token history,
+  its restart ranges and when it was last used. Its own thread writes them in order (a temporary name,
+  synced, renamed), so a removal queued before a write of the same session cannot land after it;
+- a run that continues a session which has a copy first says what it rewrites (`kStInval`), so the copy a
+  crash leaves is never mistaken for the session's state;
+- a session that is released or evicted has its history file removed with its copy.
+
+**A planned stop.** On SIGTERM (`service.sh stop` and `restart`, a lend, `run4.sh stop`), rank 0's
+server ends the requests in flight (paused ones and those waiting for their turn too: "the server is
+stopping"), then:
 - moves every slot's session's state into the store, as taking its slot for another session would;
 - frees the sessions unused for `--keep-days` (7);
-- spills the sessions still in device memory to the disk tier, the most recently used first, as far
-  as N GiB (the service's `DSGB10_KEEP_GIB`, 4), and frees the rest. That bounds the stop's writes.
-  Sessions already on disk stay. When the file is full, a spill drops its least recently used
-  sessions, as any spill does;
-- sends `kStKeep` with a random generation. Every rank waits for its writes, `fdatasync`s its file
-  and writes its index, `rank<r>.<tag>.index`: each session's blocks and their checksums, the store's
-  layout, the run id (below), the generation and the time;
-- writes the kept sessions' histories, `server.<tag>.index`: each session's id, the tokens its state
-  holds, its restart ranges and when it was last used. Same generation. Then the ranks stop together
-  (`kCmdStop`).
+- sends `kStCopy` for every other session, so what is still only in device memory becomes a copy too;
+- sends `kStSync`: every copy in the file and on the disk (`fdatasync`);
+- queues the histories that changed and drains its own file queue;
+- then the ranks stop together (`kCmdStop`), and every rank's file stays (a copy names it).
 
-dsfront saves its session table at its own stop (`--table-file`; the service's is `run/front.table`):
-each session's text and token ids, by which a restarted dsfront sends a conversation's next turn to
-the same session. During a lend dsfront keeps running, and its table stays in memory.
+dsfront writes each session's file after every finished turn too (`--table-dir`; the service's is
+`run/front.d`), so its table is as durable as the engine's copies; there is no whole-table save at its
+stop, and a shutdown only drains the writer's queue. The table's limits are `--table-sessions` (256) and
+`--table-tokens` (16777216): with the disk tier they bound what it can serve, since a session kept there
+needs its dsfront entry ([The disk tier](#serving)). `--traffic-file FILE` appends one JSON line per
+request, at its end, with counts, times and flags only: never text, token ids, the API key or a client
+address.
 
-**The start.** Each rank reads its index and checks:
-- the magic, its rank, the run id, the store's layout, and a hash over the records;
-- the age: an index written more than `--keep-days` ago is cleared;
-- every record: handles unique, blocks on the 64 KiB grain, inside the file, none overlapping;
-- the file beside it: a regular file of this user, mode 0600, of the size the index names.
+**The start.** Each rank makes its `rank<r>.<tag>.d` (mode 0700), offers its free space and the size of
+its spill file when that directory holds an index file of this run, and the ranks share both (an
+allgather). When every rank's file is the same size, that size is at most every offer and one index file
+is of this run, every rank opens its file as it is; anything else starts clean and removes the spill
+file, every index file and the legacy `rank<r>.<tag>.index`. A start that reuses reads and checks every
+index file:
+- the magic, the run id, the rank, the store's layout's byte sizes, the file's size, the body's hash, and
+  every offset on the 64 KiB grain and inside the file;
+- the age: a copy written more than `--keep-days` ago is cleared.
 
-The ranks then share their generations and file sizes (an allgather). If every rank's index checks
-out with the same generation, and the file fits every rank's offer, every rank opens its file as it
-is. Its sessions become spilled sessions of the disk tier. They come back on demand like any other,
-each block checked against its checksum. Rank 0's server takes the histories of the same generation,
-and frees any session of the store they do not name. So the front-end's session ids find their
-sessions as before the stop. The indexes are removed once read, so a crash from then on starts clean.
+The ranks then share the `(h, seq)` pairs they have (counts first, then a padded fixed-size array of the
+most any rank has), keep the highest `seq` for each `h` that every rank has, and remove every other index
+file. Above 262,144 pairs on a rank it logs and starts clean. The sessions become spilled sessions of
+the disk tier, and rank 0's server reads their histories back (`load_recovered`): a file whose session
+the store does not hold, whose copy `seq` differs, or that is unused for `--keep-days` goes, and the
+store's sessions no file names are freed. So the front-end's session ids find their sessions as before
+the stop, and a session's next turn restarts from its own copy.
 
-Anything else starts clean, and every rank removes the kept files:
+**The failure modes.** The run id (below) decides what may be reused; a copy that comes back different
+from its checksum removes its index file and stops the engine, so the next start drops it instead of
+looping. `DSGB10_COPY_FAULT=N` (test only) exits the writer before the index file of copy `N` is
+written, which is what a crash between a copy's blocks and its index looks like.
+
 - **A new build.** The run id is a hash of the binary's bytes, of the weights' and the Engram files'
   paths, sizes and times, and of the options that change what a request computes (`--max-ctx`,
   `--exact`, drafts, the drafter head's FP8, `--prefill-rows`, `--small-rows`, `--snap-every`,
-  `--no-engram`, `--layers`, `--first`, `--ring-cap`, `--draft-head4`, `--draft-markov8`). So a deploy with a new engine binary fails the
-  check and starts clean. That is meant: the old build's state need not be the new one's.
-- **A crash** (`kill -9`, a dead peer, an OOM) writes nothing. The indexes of the last planned stop
-  went when that start read them.
-- **A stop that failed partway**: a rank died, or could not write its index. The generations then
-  differ, or an index is missing.
-- **A damaged or foreign file**, or one older than `--keep-days`.
-- **`--keep-gib 0`**: nothing is kept, and nothing is taken back.
+  `--no-engram`, `--layers`, `--first`, `--ring-cap`, `--draft-head4`, `--draft-markov8`, and
+  `--shared-kv` when it is on). So a deploy with a new engine binary fails
+  the check and starts clean. That is meant: the old build's state need not be the new one's.
+- **A crash** (`kill -9`, a dead peer, an OOM) loses at most the turn in flight: the copies of every
+  finished turn are on the disk, with their index files written after their blocks.
+- **A damaged or foreign file**, or one older than `--keep-days`, is removed.
+- **`--disk-gib 0`**: no tier, nothing written through, nothing taken back.
 
-A kept block that comes back different from its checksum stops the engine (`state: session …, kept
-by an earlier run, came back different from the disk`), so that no turn continues from a wrong state.
-The next start is clean.
+A block of a session that comes back different from its checksum stops the engine (`state: session …
+came back different from the disk (…): its index is removed, so the next start drops it`), so that no
+turn continues from a wrong state. The next start drops that session and every other one is unaffected.
 
-**What is kept, where, and for how long.** The kept files hold what the conversations left: the token
-histories are the conversations themselves, and dsfront's table holds their text.
+**What is kept, where, and for how long.** The copies hold what the conversations left: the token
+histories are the conversations themselves, and dsfront's files hold their text.
 
 | file | where | holds |
 |---|---|---|
 | `rank<r>.service.spill` | every box's spill directory (`RANK<r>_SPILL`): `/data/dsgb10/spill` on rank 0, `~/dsgb10/spill` on the others | rank r's slice of each session's state: compressed caches, window and end snapshots. It is the disk tier's file (`--disk-gib`, 32 GiB), reused as it is |
-| `rank<r>.service.index` | beside it | each session's blocks and checksums |
-| `server.service.index` | beside rank 0's, on rank 0 | each session's id and token history |
-| `front.table` | `~/dsgb10/service/run` on rank 0 | each dsfront session's text and token ids |
+| `rank<r>.service.d/<h>.<seq>.c` | beside it | one session's copy: its blocks' offsets and the checksums they went out with |
+| `server.service.d/<id>.<h>.<seq>.s` | beside rank 0's, on rank 0 | one session's id, token history, restart ranges and last use |
+| `front.d/<id>.t` | `~/dsgb10/service/run` on rank 0 | one dsfront session's text and token ids |
 
-- **Private.** Every one is mode 0600, in a directory of mode 0700. The engine makes its spill
-  directory 0700, and refuses a kept file that is not a regular file of its user, mode 0600; dsfront
-  does the same with its table. Each is written under a temporary name (`.new`, created exclusively,
-  following no link), synced and renamed into place, so it is whole or absent.
+- **Private.** Every one is mode 0600, in a directory of mode 0700. The engine makes its directories
+  0700, and refuses a file that is not a regular file of its user, mode 0600; dsfront does the same with
+  its own. Each is written under a temporary name (created exclusively, following no link), synced and
+  renamed into place, so it is whole or absent.
 - **Never in a repository.** The engine refuses a disk tier inside a git work tree (a `.git` in the
   directory or above it: `no disk tier: … is in a git tree`). The service's run directory is outside
   any checkout.
 - **Never in the logs.** They give counts, sizes and times, never tokens or text.
 - **The service's own.** The service runs the engine with `--disk-tag service`, so its files are
-  `rank<r>.service.*` and `server.service.index`. A development run uses no tag (`rank<r>.spill`) or
-  one of its own, and never touches them.
+  `rank<r>.service.*`, `server.service.d/` and `run/front.d/`. A development run uses no tag
+  (`rank<r>.spill`) or one of its own, and never touches them.
 - **How long.**
-  - The indexes and dsfront's table last until the next start, which reads and removes them.
-  - The sessions last as long as the disk tier keeps them. A session unused for `--keep-days` (7) is
-    neither kept at a stop nor taken back at a start; dsfront's `--table-days` is 7 too. When the
-    file is full, its least recently used sessions are dropped.
-  - An index written more than 7 days before the start is cleared whole.
+  - A copy is replaced by the next turn's; the index file of the one it replaces goes with it (an offset
+    is never handed out again before no index file names it).
+  - A session unused for `--keep-days` (7) is neither copied at a stop nor taken back at a start;
+    dsfront's `--table-days` is 7 too. When the file is full, its least recently used sessions are
+    dropped.
+  - A copy written more than 7 days before the start is cleared.
   - `forget` removes them all.
 - **Forgetting.** `service.sh forget`, or `stop --forget`, removes the four kinds of file on every
-  box. It refuses while the service runs, since the service would keep them again at its stop. It
-  says so when files are left (a box unreachable): run it again. By hand, with the service stopped:
+  box. It refuses while the service runs, since the service would write them again. It says so when
+  files are left (a box unreachable): run it again. By hand, with the service stopped:
 
   ```
-  rm -f /data/dsgb10/spill/*.service.* ~/dsgb10/service/run/front.table*; for h in 10.0.0.4 10.0.0.3 10.0.0.2; do ssh $h 'rm -f ~/dsgb10/spill/*.service.*'; done
+  rm -f /data/dsgb10/spill/*.service.* ; rm -rf /data/dsgb10/spill/*.service.d ~/dsgb10/service/run/front.d; for h in 10.0.0.4 10.0.0.3 10.0.0.2; do ssh $h 'rm -f ~/dsgb10/spill/*.service.*; rm -rf ~/dsgb10/spill/*.service.d'; done
   ```
 
-Tested against the mock engine ([tests/yield_test.sh](../engine/server/tests/yield_test.sh), 42
-of 42): dsfront saved its table at the stop (mode 600) and took it back at the next start, and the file
-was gone; `forget` was refused while the service ran, and `stop --forget` stopped it and removed the
-table. The table's round trip and its refusals (damaged, mode 0644, too old) are dsfront's unit tests.
+`tests/yield_test.sh` (the mock engine, 42 of 42 before this change) still checks `run/front.table`; it
+moves to `run/front.d` and a per-session file with the next run of that test — it is a service test, run
+by the orchestrator, not here. dsfront's own unit tests cover the files' round trip and their refusals
+(damaged, another version's magic, too old, a directory in a git tree).
 
-**Measured on the ring, 2026-10-12.** The engine was f737e73's build (sha256 9203dcdf…, which master
+**Measured on the ring, 2026-10-12** (the *previous* mechanism: one index written at a planned stop,
+which TS2 replaced with the write-through copies above; the numbers are kept for the stop's and the
+start's cost). The engine was f737e73's build (sha256 9203dcdf…, which master
 d7b33ce builds the same), driven by `tests/kept_test.py` through rank 0's socket (`--session-gib 0.4
 --disk-gib 8`). Its files had their own tags, kref and ktest, and were wiped afterwards. Production's
 request preempted the first window after three steps at 10:02:58; the rest ran in the next lend.
@@ -5570,7 +5691,8 @@ A small agentic turn spends most of its prefill in the routed experts. Its passe
 - the floors are per expert;
 - it reports GB/s and the MoE's time summed over a case's layers;
 - `PF_CGRP` splits down into the engine's column groups;
-- `PF_TURNS` reads the engine's own route dumps (`DSGB10_ROUTE_DUMP` on branch runner-ttft).
+- `PF_TURNS` reads the engine's own route dumps (`DSGB10_ROUTE_DUMP` on branch runner-ttft, now
+  `DSGB10_PREFILL_ROUTE_DUMP`).
 
 The engine is unchanged.
 
@@ -5809,8 +5931,9 @@ reaches it only if both kernels hit their targets.
 The engine is master 0eb3a7d (the coded scales) with profiling hooks, built from 8805de4 (2c85d77 on branch
 runner-ttft, after a rebase onto c748dd4). The hooks are compiled only with `-DDSGB10_NVTX=ON`:
 - NVTX ranges per turn, chunk, layer and part;
-- `DSGB10_ROUTE_DUMP`: rank 0's routes for every pass;
 - serve's `--profile-from-req N`: request N opens nsys's capture range on every rank.
+`DSGB10_ROUTE_DUMP` (that branch's name for the prefill dump, now `DSGB10_PREFILL_ROUTE_DUMP`, which needs no
+profiling build): rank 0's routes for every pass;
 
 The turns:
 - `ttft_turns.py` drives a test server at production's `--max-ctx 262144`. Each ring part runs through

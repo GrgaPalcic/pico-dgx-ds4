@@ -9,14 +9,15 @@ namespace attn {
 namespace {
 
 // One 128-thread CTA per row (compressor.cuh emit_row), into the row's session's state.
+template <bool kPaged>
 __global__ void __launch_bounds__(128) emit_kernel(const float* kv, const float* score, const int* pos, int rows,
                                                    CompressorWeights w, CompressorCarry carry, const float2* table,
                                                    Compressed ckv, IndexKeys ik, uint16_t* dbg_latent, int dbg_base,
                                                    const int* nrows, int row_base) {
   const int r = blockIdx.x;
   if (nrows && r >= *nrows - row_base) return;  // wide64: a pad row
-  emit_row(r, r > 0 && same_session(carry.slot, r - 1, r), kv, score, pos, w, carry_at(carry, r), table, ckv_at(ckv, r),
-           ik_at(ik, r), dbg_latent, dbg_base);
+  emit_row<kPaged>(r, r > 0 && same_session(carry.slot, r - 1, r), kv, score, pos, w, carry_at(carry, r), table,
+                   ckv_at(ckv, r), ik_at(ik, r), dbg_latent, dbg_base);
 }
 
 // keep the last (up to) 16 rows' ratio-2 projections, by position
@@ -43,8 +44,13 @@ void compressor_emit(const float* kv, const float* score, const int* pos, int ro
   check_slots(carry, "compressor_emit");
   check_slots(ckv, "compressor_emit");
   check_slots(ik, "compressor_emit");
-  emit_kernel<<<rows, 128, 0, s>>>(kv, score, pos, rows, w, carry, table, ckv, ik, debug_latent, debug_base, nrows,
-                                   row_base);
+  if (ckv.pages.paged() != ik.pages.paged()) die("compressor_emit: pages on one cache and not the other");
+  if (ckv.pages.paged())
+    emit_kernel<true><<<rows, 128, 0, s>>>(kv, score, pos, rows, w, carry, table, ckv, ik, debug_latent, debug_base,
+                                           nrows, row_base);
+  else
+    emit_kernel<false><<<rows, 128, 0, s>>>(kv, score, pos, rows, w, carry, table, ckv, ik, debug_latent, debug_base,
+                                            nrows, row_base);
   CUDA_CHECK(cudaGetLastError());
   if (w.ratio > 1) {
     carry_kernel<<<rows < 16 ? rows : 16, 128, 0, s>>>(kv, score, pos, rows, carry, nrows, row_base);

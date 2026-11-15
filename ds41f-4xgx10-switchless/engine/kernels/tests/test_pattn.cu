@@ -1,7 +1,9 @@
 // Checks the prefill attention-side kernels (prefill_attn/index/comp/mhc.cu) against engine/attn's kernels
 // on synthetic long-context state, and against the reference cases of engine/attn/tests (gen_attn.py,
 // gen_mhc.py) like attn_tests does.
-// usage: test_pattn [case root, default ~/dsgb10-data/attntests ("" for it)] [only: attn|index|comp|mhc]
+// usage: test_pattn [case root, default ~/dsgb10-data/attntests ("" for it)] [only: attn|index|comp|mhc] [pages]
+// `pages` (docs/shared-kv.md §2.3, --shared-kv): every synthetic case also runs with its caches in a
+// device pool's pages (no flag, no data directory) and must match the contiguous run bit for bit.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -18,6 +20,7 @@
 #include "attn/tests/testutil.h"
 #include "kernels/dsk.h"
 #include "kernels/prefill_attn.h"
+#include "model/pages.h"
 
 using namespace attn_test;
 
@@ -71,6 +74,77 @@ uint32_t g_seed = 7;
 void rnd_u8(Dev<uint8_t>& d, uint32_t mask, uint32_t add) { fill_u8<<<512, 256>>>(d.p, d.n, g_seed++, mask, add); }
 void rnd_bf16(Dev<uint16_t>& d, float scale) { fill_bf16<<<512, 256>>>(d.p, d.n, g_seed++, scale); }
 void rnd_f32(Dev<float>& d, float scale) { fill_f32<<<512, 256>>>(d.p, d.n, g_seed++, scale); }
+
+// ---- the pool's pages (the `pages` argument) ---------------------------------------------------------
+// When the engine runs with --shared-kv a kv source's caches are the store pool's pages (docs/shared-kv.md
+// §2.3): one pool block per page of model/pages.h's geometry, entry e at `tab[e >> shift] + off[a] +
+// (e & mask) * bytes`. PagePool builds one with its pages handed out in a shuffled order, so a page's
+// address says nothing about its index; move_pages moves a contiguous cache into it (a case's inputs) or
+// back out (a case's outputs), so every case can run both ways and the results compared entry by entry.
+__global__ void move_pages(const uint64_t* __restrict__ tab, int shift, uint32_t off, int bytes, int n,
+                           const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, int to_pages) {
+  const int mask = (1 << shift) - 1;
+  for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n; e += gridDim.x * blockDim.x) {
+    const uintptr_t at = (uintptr_t)tab[e >> shift] + off + (size_t)(e & mask) * bytes;
+    const uint8_t* in = to_pages ? src + (size_t)e * bytes : reinterpret_cast<const uint8_t*>(at);
+    uint8_t* out = to_pages ? reinterpret_cast<uint8_t*>(at) : dst + (size_t)e * bytes;
+    for (int i = 0; i < bytes; i += 4)
+      *reinterpret_cast<uint32_t*>(out + i) = *reinterpret_cast<const uint32_t*>(in + i);
+  }
+}
+
+struct PagePool {
+  Dev<uint8_t> mem;   // npages blocks, one page each
+  Dev<uint64_t> tab;  // their addresses, out of order
+  int npages = 0, shift = 0;
+  uint32_t off[4] = {};
+  // `entries` entries of a source of `ratio` (1 or 2) positions per entry, `seed` shuffling the pages
+  void build(int entries, int ratio, uint32_t seed) {
+    using namespace model::detail;
+    const int per = kPagePos / ratio;
+    npages = std::max(1, (entries + per - 1) / per);
+    mem = Dev<uint8_t>((size_t)npages * kPageBlock);
+    std::vector<int> p(npages);
+    for (int i = 0; i < npages; ++i) p[i] = i;
+    std::shuffle(p.begin(), p.end(), std::mt19937(seed));
+    if (npages > 1 && p[0] == 0) std::swap(p[0], p[1]);  // never in address order
+    std::vector<uint64_t> h(npages);
+    for (int i = 0; i < npages; ++i) h[i] = (uint64_t)(mem.p + (size_t)p[i] * kPageBlock);
+    tab = Dev<uint64_t>(h.data(), npages);
+    shift = ratio == 1 ? kPageShift : kPageShift - 1;
+    layout_of(ratio, off);
+  }
+  attn::KvPages view() const {
+    attn::KvPages v;
+    v.tab = tab.p;
+    v.shift = shift;
+    for (int a = 0; a < 4; ++a) v.off[a] = off[a];
+    return v;
+  }
+  void in(int a, const uint8_t* src, int n, size_t bytes) const {  // a contiguous array's n entries
+    move_pages<<<64, 256>>>(tab.p, shift, off[a], (int)bytes, n, src, nullptr, 1);
+    CUDA_CHECK(cudaGetLastError());
+  }
+  void out(int a, uint8_t* dst, int n, size_t bytes) const {
+    move_pages<<<64, 256>>>(tab.p, shift, off[a], (int)bytes, n, nullptr, dst, 0);
+    CUDA_CHECK(cudaGetLastError());
+  }
+};
+
+// A `pages` case: one synthetic case's paged run and the comparisons against its contiguous run. Every
+// comparison must match; the mode prints how many cases ran and how many matched (zero is a failure, main).
+int g_pages_cases = 0, g_pages_ok = 0;
+struct PagesCase {
+  bool bad = false;
+  PagesCase() { ++g_pages_cases; }
+  ~PagesCase() { g_pages_ok += !bad; }
+  void equal(const void* got, const void* ref, size_t bytes, const std::string& what) {
+    const bool eq = std::memcmp(got, ref, bytes) == 0;
+    bad |= !eq;
+    if (!eq) ++g_failures;
+    std::printf("%-44s pages: %zu bytes %s\n", what.c_str(), bytes, eq ? "equal ok" : "DIFFER FAIL");
+  }
+};
 
 // ---- attention yardstick ----------------------------------------------------------------------------
 // relative L2 error per (row, head) against fp64, ours and a second result (attn's kernel or the reference)
@@ -154,7 +228,7 @@ std::vector<float> q_rope(const uint16_t* qh, const float* tb) {
 // ---- sparse attention, synthetic -------------------------------------------------------------------------
 // R rows ending at position ctx-1 of a ratio-2 layer, every row with kmax random entries of its causal range
 // (rows near the start of the sequence keep fewer, padded with -1); both kernels against fp64.
-void test_attn_synth(int R, int ctx, int kmax, int winscale_lo, int win_lo = 0) {
+void test_attn_synth(int R, int ctx, int kmax, int winscale_lo, int win_lo = 0, bool pages = false) {
   char name[96];
   std::snprintf(name, sizeof name, "attn synth R=%d ctx=%d kmax=%d%s", R, ctx, kmax, win_lo ? " win_lo" : "");
   const int p0 = ctx - R, maxpos = ctx + 16, ncap = ctx / 2 + 1;
@@ -201,6 +275,21 @@ void test_attn_synth(int R, int ctx, int kmax, int winscale_lo, int win_lo = 0) 
   CUDA_CHECK(cudaDeviceSynchronize());
   auto ha = out_a.host(), hp = out_p.host(), hq = q.host();
   report(std::string(name) + " vs attn", cmp_bf16(hp.data(), ha.data(), ha.size()), false, false);
+  if (pages) {  // the same case with the entries in the pool's pages, as a ratio-2 and a ratio-1 source
+    PagesCase pc;
+    Dev<uint16_t> out_pg((size_t)R * 16 * 512);
+    for (int ratio : {2, 1}) {
+      PagePool pg;
+      pg.build(ncap, ratio, 0x2b * ratio + R);
+      pg.in(0, ckv.p, ncap, 256);
+      pg.in(1, csc.p, ncap, 32);
+      attn::Compressed ccp{nullptr, nullptr, ncap, nullptr, 0, 0, pg.view()};
+      dsk::sparse_attn_p(q.p, pos.p, R, table.p, win, ccp, kmax ? topk.p : nullptr, kmax, sink.p, out_pg.p, 0, win_lo);
+      CUDA_CHECK(cudaDeviceSynchronize());
+      pc.equal(out_pg.host().data(), hp.data(), hp.size() * 2,
+               std::string(name) + " pages r" + std::to_string(ratio));
+    }
+  }
   auto hk = wkv.host(), hs = wsc.host(), hc = ckv.host(), hcs = csc.host();
   auto ht = table.host();
   auto hsink = sink.host();
@@ -447,7 +536,7 @@ void report_keys(const std::string& name, const Dev<uint16_t>& got, const Dev<ui
 
 // R rows ending at ctx on random queries and keys: keys (and block maxima) bit-identical to attn's dense
 // scan, the batched selection equal to attn::index_topk's
-void test_index_synth(int R, int ctx, int ratio, bool pool, int batch) {
+void test_index_synth(int R, int ctx, int ratio, bool pool, int batch, bool pages = false) {
   const int n = ctx / ratio, cap = n + 64, stride = (n + 255) / 256 * 256, K = 512, KB = 2048;
   std::vector<int> ph(R);
   for (int r = 0; r < R; ++r) ph[r] = ctx - R + r;
@@ -481,6 +570,31 @@ void test_index_synth(int R, int ctx, int ratio, bool pool, int batch) {
   int bad;
   report_rows(std::string(nm) + " topk", rows_equal(tgot.host(), tref.host(), R, K, &bad), R);
   if (pool) report_rows(std::string(nm) + " pool", rows_equal(pgot.host(), pref.host(), R, KB, &bad), R);
+  if (pages) {  // the same case with the keys and their scales in the pool's pages
+    PagesCase pc;
+    PagePool pg;
+    pg.build(cap, ratio, 0x3d + R);
+    pg.in(2, kk.p, cap, 64);
+    pg.in(3, ksc.p, cap, 4);
+    attn::IndexKeys ikp{nullptr, nullptr, cap, nullptr, 0, 0, pg.view()};
+    Dev<uint16_t> kg((size_t)R * stride), bg((size_t)R * stride / 8);
+    Dev<int> tg((size_t)R * K), pgl((size_t)R * KB);
+    Dev<uint16_t> kyg2((size_t)R * K), pkg2((size_t)R * KB);
+    Dev<uint16_t> sck((size_t)batch * stride), bsc((size_t)batch * stride / 8);
+    dsk::index_score_p(q, pos.p, R, ratio, ikp, n, kg.p, stride, pool ? bg.p : nullptr, stride / 8, 0);
+    dsk::index_topk_p(q, pos.p, R, ratio, ikp, n, batch, sck.p, stride, K, tg.p, kyg2.p, pool ? bsc.p : nullptr, KB,
+                      pgl.p, pkg2.p, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    pc.equal(kg.host().data(), kgot.host().data(), (size_t)R * stride * 2, std::string(nm) + " keys pages");
+    if (pool)
+      pc.equal(bg.host().data(), bgot.host().data(), (size_t)R * stride / 8 * 2, std::string(nm) + " bkeys pages");
+    pc.equal(tg.host().data(), tgot.host().data(), (size_t)R * K * 4, std::string(nm) + " topk pages");
+    pc.equal(kyg2.host().data(), kyg.host().data(), (size_t)R * K * 2, std::string(nm) + " topkeys pages");
+    if (pool) {
+      pc.equal(pgl.host().data(), pgot.host().data(), (size_t)R * KB * 4, std::string(nm) + " pool pages");
+      pc.equal(pkg2.host().data(), pkg.host().data(), (size_t)R * KB * 2, std::string(nm) + " poolkeys pages");
+    }
+  }
 }
 
 // The prefill call of the case's index-source layers: keys against attn's, top-k against model.py's
@@ -591,7 +705,7 @@ struct CompCaches {
 // carry bit-identical, index keys equal but for rare entries (wk's summation order)
 void compare_emit(const std::string& nm, const float* kv, const float* score, const int* pos, int rows,
                   const attn::CompressorWeights& w, const float2* table, int cap, const std::vector<float>& carry_kv,
-                  const std::vector<float>& carry_sc) {
+                  const std::vector<float>& carry_sc, bool pages = false) {
   CompCaches A(cap), D(cap);
   for (CompCaches* c : {&A, &D}) {
     CUDA_CHECK(cudaMemcpy(c->ckv.p, carry_kv.data(), carry_kv.size() * 4, cudaMemcpyHostToDevice));
@@ -610,10 +724,34 @@ void compare_emit(const std::string& nm, const float* kv, const float* score, co
     if (!ok) ++g_failures;
     std::printf("%-44s carry %s\n", (nm + " carry").c_str(), ok ? "equal ok" : "differs FAIL");
   }
+  if (pages) {  // the same emit with the entries in the pool's pages: every entry bit for bit
+    PagesCase pc;
+    PagePool pg;
+    pg.build(cap, w.ratio, 0x5f + rows);
+    CompCaches P(cap);
+    CUDA_CHECK(cudaMemcpy(P.ckv.p, carry_kv.data(), carry_kv.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(P.csc.p, carry_sc.data(), carry_sc.size() * 4, cudaMemcpyHostToDevice));
+    attn::Compressed cp{nullptr, nullptr, cap, nullptr, 0, 0, pg.view()};
+    attn::IndexKeys kp{nullptr, nullptr, cap, nullptr, 0, 0, pg.view()};
+    dsk::compressor_emit_p(kv, score, pos, rows, w, P.carry(), table, cp, kp, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    Dev<uint8_t> gkv((size_t)cap * 256), gsc((size_t)cap * 32), gik((size_t)cap * 64), gisc((size_t)cap * 4);
+    pg.out(0, gkv.p, cap, 256);
+    pg.out(1, gsc.p, cap, 32);
+    pg.out(2, gik.p, cap, 64);
+    pg.out(3, gisc.p, cap, 4);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    pc.equal(gkv.host().data(), D.kv.host().data(), (size_t)cap * 256, nm + " ckv pages");
+    pc.equal(gsc.host().data(), D.sc.host().data(), (size_t)cap * 32, nm + " csc pages");
+    pc.equal(gik.host().data(), D.ik.host().data(), (size_t)cap * 64, nm + " ik pages");
+    pc.equal(gisc.host().data(), D.isc.host().data(), (size_t)cap * 4, nm + " iksc pages");
+    if (w.ratio > 1)  // the carry is per slot, not in the pages
+      pc.equal(P.ckv.host().data(), D.ckv.host().data(), P.ckv.n * 4, nm + " carry pages");
+  }
 }
 // rows consecutive positions from p0 on random weights: projections against attn::compressor_project, the
 // entries from attn's projections against attn::compressor_emit
-void test_comp_synth(int rows, int ratio, int p0) {
+void test_comp_synth(int rows, int ratio, int p0, bool pages = false) {
   const int maxpos = p0 + rows + 1, cap = maxpos / ratio + 1;
   char nm[64];
   std::snprintf(nm, sizeof nm, "comp synth rows=%d ratio=%d p0=%d", rows, ratio, p0);
@@ -645,7 +783,7 @@ void test_comp_synth(int rows, int ratio, int p0) {
   std::normal_distribution<float> nd(0.f, 1.f);
   for (auto& v : ck) v = nd(rng);
   for (auto& v : cs) v = nd(rng);
-  compare_emit(nm, kva.p, sca.p, pos.p, rows, w, table.p, cap, ck, cs);
+  compare_emit(nm, kva.p, sca.p, pos.p, rows, w, table.p, cap, ck, cs, pages);
 }
 // the prefill call of a case's kv-source layers: projections against model.py's, the entries (from
 // model.py's projections) against attn::compressor_emit's, which equal model.py's
@@ -923,29 +1061,33 @@ void test_mhc_rows() {
 int main(int argc, char** argv) {
   g_root = argc > 1 && argv[1][0] ? argv[1] : std::string(getenv("HOME")) + "/dsgb10-data/attntests";
   std::string only = argc > 2 ? argv[2] : "";
+  const bool pages = argc > 3 && std::string(argv[3]) == "pages";
   auto want = [&](const char* s) { return only.empty() || only == s; };
   if (want("attn")) {
-    test_attn_synth(300, 4096, 512, 112);
-    test_attn_synth(1024, 65536, 512, 116);
-    test_attn_synth(700, 20000, 0, 118);
-    test_attn_synth(200, 200, 512, 112);  // the start of a sequence: short windows and lists
-    test_attn_synth(128, 65536, 512, 114, 65536 - 128);  // CED's decoder replay: the window inside the chunk
+    test_attn_synth(300, 4096, 512, 112, 0, pages);
+    test_attn_synth(1024, 65536, 512, 116, 0, pages);
+    test_attn_synth(700, 20000, 0, 118, 0, pages);
+    test_attn_synth(200, 200, 512, 112, 0, pages);  // the start of a sequence: short windows and lists
+    test_attn_synth(128, 65536, 512, 114, 65536 - 128, pages);  // CED's decoder replay: the window inside the chunk
     for (const char* c : {"l0", "l2", "l20"})
       if (npy_exists(g_root + "/" + c + "/manifest.json")) test_attn_case(g_root + "/" + c);
   }
   if (want("index")) {
-    test_index_synth(300, 4096, 2, false, 64);
-    test_index_synth(96, 2000, 1, true, 40);
-    test_index_synth(1024, 131072, 2, false, 96);
-    test_index_synth(128, 65536, 1, true, 128);
+    test_index_synth(300, 4096, 2, false, 64, pages);
+    test_index_synth(96, 2000, 1, true, 40, pages);
+    test_index_synth(1024, 131072, 2, false, 96, pages);
+    test_index_synth(128, 65536, 1, true, 128, pages);
+    test_index_synth(600, 20000, 1, true, 64, pages);  // a ratio-1 chunk across five pages, mid-page start
     for (const char* c : {"l2", "l20"})
       if (npy_exists(g_root + "/" + c + "/manifest.json")) test_index_case(g_root + "/" + c);
   }
   if (want("comp")) {
-    test_comp_synth(300, 2, 0);
-    test_comp_synth(1001, 2, 4097);  // odd start: row 0 completes the carry's group
-    test_comp_synth(1024, 1, 12288);
-    test_comp_synth(37, 2, 15);
+    test_comp_synth(300, 2, 0, pages);
+    test_comp_synth(1001, 2, 4097, pages);  // odd start: row 0 completes the carry's group
+    test_comp_synth(1024, 1, 12288, pages);
+    test_comp_synth(37, 2, 15, pages);
+    test_comp_synth(4200, 2, 4101, pages);  // entries 2050..4150: mid-page start, two page boundaries
+    test_comp_synth(4200, 1, 4101, pages);  // entries 4101..8300: mid-page start, one page boundary
     for (const char* c : {"l2", "l20"})
       if (npy_exists(g_root + "/" + c + "/manifest.json")) test_comp_case(g_root + "/" + c);
   }
@@ -955,6 +1097,10 @@ int main(int argc, char** argv) {
     test_mhc_synth(37, g_root + "/mhc");
   }
   if (want("mhc") || want("mhcrows")) test_mhc_rows();
+  if (pages) {
+    std::printf("pages: %d cases, %d matched\n", g_pages_cases, g_pages_ok);
+    if (g_pages_cases == 0 || g_pages_ok != g_pages_cases) ++g_failures;
+  }
   std::printf("%s (%d failing checks)\n", g_failures ? "FAILED" : "PASSED", g_failures);
   return g_failures ? 1 : 0;
 }

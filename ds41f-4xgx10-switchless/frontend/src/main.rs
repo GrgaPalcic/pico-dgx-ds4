@@ -26,10 +26,16 @@ fn usage() -> ! {
       --hold-s N                while the engine is down (the ring lent, or a restart), a request
                                 waits this long (600), then is answered 503 with Retry-After: 60
       --admin-socket PATH       commands from service.sh (mode 600): status, hold IDLE_S, release
-      --table-file PATH         the session table, saved here at a stop and taken back at the next
-                                start (mode 600, in a directory of mode 700; it holds the
-                                conversations' text), so that the engine's kept sessions are found again
+      --table-dir DIR           the session table: one file per session (`<id 16 hex>.t`) in DIR,
+                                written after every finished turn and read back at the next start
+                                (mode 600 in a directory of mode 700; it holds the conversations'
+                                text), so that the engine's sessions on disk are found again
       --table-days N            sessions unused for longer are not kept: 7
+      --table-sessions N        sessions the table holds at most (256); with the engine's disk tier
+                                each session kept there needs its entry, so size this to the tier
+      --table-tokens N          ids the table holds in all, across sessions (16777216)
+      --traffic-file PATH       append one JSON line per request, at its end (counts, times and flags
+                                only: never text, token ids, the key or an address; mode 600)
       --vision-addr HOST:PORT   accept image_url / image parts: the image encoder (tools/vision) turns
                                 them into embedding rows (docs/vision.md); without it images are refused
   dsfront admin --socket PATH <command>               one command to a server's admin socket; prints
@@ -106,6 +112,8 @@ fn serve(args: &[String]) {
     if api_key.is_none() {
         eprintln!("warning: no --api-key-file, requests are not authenticated");
     }
+    let table_dir = opt(args, "--table-dir").map(std::path::PathBuf::from);
+    let table_age_s = (parse_opt(args, "--table-days", 7f64) * 86400.0) as u64;
     let cfg = ServerConfig {
         model_name: opt(args, "--model-name").unwrap_or_else(|| "deepseek-v4.1-flash-uncensored".into()),
         api_key,
@@ -117,20 +125,27 @@ fn serve(args: &[String]) {
         default_top_p: parse_opt(args, "--top-p", 0.95f32),
         loop_guard: if args.iter().any(|a| a == "--no-loop-guard") { None } else { Some(Default::default()) },
         tokenize_threads: parse_opt(args, "--tokenize-threads", 8usize).max(1),
+        table_sessions: parse_opt(args, "--table-sessions", 256usize),
+        table_tokens: parse_opt(args, "--table-tokens", 16usize << 20),
+        table_dir: table_dir.clone(),
         dump_dir: opt(args, "--dump-dir").map(Into::into),
         hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
         vision_addr: opt(args, "--vision-addr"),
     };
+    let traffic = opt(args, "--traffic-file").map(|p| {
+        dsfront::traffic::Traffic::new(std::path::Path::new(&p)).unwrap_or_else(|e| {
+            eprintln!("{p}: {e}");
+            std::process::exit(1)
+        })
+    });
     let admin = opt(args, "--admin-socket");
-    let table = opt(args, "--table-file").map(std::path::PathBuf::from);
-    let table_age_s = (parse_opt(args, "--table-days", 7f64) * 86400.0) as u64;
     let tok = std::sync::Arc::new(load_tokenizer(args));
     let socket = opt(args, "--engine-socket").unwrap_or_else(|| dsfront::protocol::DEFAULT_SOCKET.into());
     runtime().block_on(async move {
         let engine = dsfront::engine::EngineClient::start(socket.into());
-        let app = App::new(cfg, tok, engine);
-        if let Some(t) = &table {
-            eprintln!("{}", app.load_sessions(t, table_age_s));
+        let app = App::new(cfg, tok, engine, traffic);
+        if table_dir.is_some() {
+            eprintln!("{}", app.load_sessions(table_age_s));
         }
         let saver = app.clone();
         if let Some(path) = admin {
@@ -175,8 +190,8 @@ fn serve(args: &[String]) {
         while let Some(r) = servers.join_next().await {
             r.expect("server task").expect("server");
         }
-        if let Some(t) = &table {
-            eprintln!("{}", saver.save_sessions(t, table_age_s));
+        if table_dir.is_some() {
+            eprintln!("{}", saver.drain_sessions());
         }
     });
 }

@@ -2,6 +2,9 @@
 // for chunks of 2048-8192 rows at per-rank shapes (TP=4, 16 heads). State, formats and numerics are
 // engine/attn's (attn/attn.h): these are the many-row versions of its decode-shaped kernels and are
 // tested against them. Rows are a chunk's query tokens in ascending position order.
+// --shared-kv (docs/shared-kv.md): a kv source's compressed entries and index keys are the store pool's
+// pages, and `ckv`/`ik` carry them in `pages` (attn/pages.cuh); the entry points below read and write
+// the entries there when `pages.tab` is set, and the contiguous caches otherwise.
 #pragma once
 #include <cstdint>
 #include <cuda_runtime.h>

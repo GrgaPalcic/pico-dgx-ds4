@@ -41,14 +41,19 @@
 // replay's first position after a CED turn; nowhere after a cancelled one). The draft module's windows
 // are the decoder's: the replay seeds them, and the encoder's snapshots hold none.
 //
-// Kept sessions (docs/engine.md): a planned stop moves the sessions to the disk tier and every rank
-// indexes its file (state.cu); this server writes their histories beside it (keep). The next start
-// whose store reused those files reads them back in (load_kept), and the front-end's session ids find
-// their sessions as before the stop.
+// Durable copies (docs/engine.md, "The disk tier"): every finished turn is written through to a complete
+// copy of its session in the engine's disk tier (state.cu state_copy), and this server writes the
+// session's history beside it (copy_session, server.<tag>.d). A kill -9, a watchdog restart or a power
+// cut loses at most the turn in flight; the next start reads the engine's copies back and this server's
+// histories with them (load_recovered).
 #include "server/serve.h"
 
 #include <poll.h>
 #include <signal.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -60,6 +65,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -114,6 +120,16 @@ bool write_all(int fd, const void* p, size_t n) {
 uint64_t us(double s) { return s > 0 ? uint64_t(s * 1e6) : 0; }
 
 double unix_now() { return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(); }
+
+// DSGB10_SUBMIT_LOG=FILE (DIAGNOSTICS, measurement only): each request's first run, one JSON line with its
+// plan and the prompt's token ids. serve opens it once at startup; production never sets it.
+FILE* submit_log() {
+  static FILE* const f = [] {
+    const char* v = getenv("DSGB10_SUBMIT_LOG");
+    return v && *v ? std::fopen(v, "a") : (FILE*)nullptr;
+  }();
+  return f;
+}
 
 // One front-end connection. Once it is closed or replaced its requests count as cancelled and frames
 // for it are dropped; the descriptor closes with the last reference.
@@ -369,20 +385,175 @@ struct Session {
   int dec_lo = 0, end_dec_lo = 0;
   std::vector<int> enc_snaps;
   double t_used = 0;  // unix time of its last request (kept sessions age out by it)
+  uint64_t cseq = 0;  // the copy seq its history file goes with (0: none written)
 };
 
-// The server's index of a planned stop's kept sessions (keep(); keepfile.h: 0600 in a 0700 directory,
-// whole or not at all): a header, then each session: id, handle, restart ranges, LRU clock and time,
-// history, encoder-only snapshots.
-constexpr char kSrvMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'S', '1'};
-struct SrvHeader {
+// A session's history beside the engine's copy of its state: <id 16 hex>.<h>.<seq>.s, one file per
+// session per copy (serve.h). Its header names the engine copy it goes with (the session's handle and
+// its copy's seq), so a start keeps only the files whose session the engine recovered, and a file whose
+// copy is gone is removed. keepfile.h's rules: mode 0600, whole or not at all, in a directory of 0700.
+constexpr char kSessMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'T', '1'};
+struct SessHeader {
   char magic[8];
-  uint64_t gen;  // the store's (state.cu): both indexes come from the same stop
-  int64_t written;
-  int32_t n_sess, next_h;
-  uint64_t clock;
-  uint64_t body_bytes, body_hash;
+  uint64_t run_id, id;
+  int32_t h;
+  uint64_t seq;      // the engine copy this history goes with
+  int64_t written;   // unix time, seconds
+  uint64_t used;     // the server's LRU clock
+  double t_used;     // and its unix time (the age limit)
+  int32_t pe_snap, end_lo, end_clo, end_w, end_dec_lo;
+  int32_t n_hist, n_enc;
+  uint64_t body_bytes, body_hash;  // the history and the encoder-only snapshots
 };
+
+// The server's own file writes: the sessions' histories and the removals of the ones they replace. One
+// thread, pinned like the spill writer (DSGB10_SPILL_CPU), takes them in order, so a write that follows
+// a removal of the same name lands; a write goes under a temporary name, synced, then renamed
+// (keepfile.h), so a reader finds the whole file or none. drain() waits for every queued job.
+class FileQueue {
+ public:
+  explicit FileQueue(const std::string& dir) : dir_(dir) {
+    if (dir_.empty()) return;  // no disk tier: nothing is written
+    if (mkdir(dir_.c_str(), 0700) != 0 && errno != EEXIST)
+      std::printf("serve: mkdir %s: %s\n", dir_.c_str(), std::strerror(errno));
+    struct stat st;
+    if (stat(dir_.c_str(), &st) == 0 && st.st_uid == getuid() && (st.st_mode & 077)) chmod(dir_.c_str(), 0700);
+    th_ = std::thread([this] { worker(); });
+  }
+  ~FileQueue() {
+    {
+      std::lock_guard<std::mutex> l(mu_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    if (th_.joinable()) th_.join();
+  }
+  void write(std::string path, std::vector<uint8_t> bytes) { push(false, std::move(path), std::move(bytes)); }
+  void remove(std::string path) { push(true, std::move(path), {}); }
+  // Until every queued job is done.
+  void drain() {
+    if (!th_.joinable()) return;
+    std::unique_lock<std::mutex> l(mu_);
+    cv_.wait(l, [&] { return q_.empty(); });
+  }
+  const std::string& dir() const { return dir_; }
+
+ private:
+  struct Job {
+    bool rm;
+    std::string path;
+    std::vector<uint8_t> bytes;
+  };
+  void push(bool rm, std::string path, std::vector<uint8_t> bytes) {
+    if (!th_.joinable()) return;
+    {
+      std::lock_guard<std::mutex> l(mu_);
+      q_.push_back(Job{rm, std::move(path), std::move(bytes)});
+    }
+    cv_.notify_all();
+  }
+  void worker() {
+    const int cpu = getenv("DSGB10_SPILL_CPU") ? std::atoi(getenv("DSGB10_SPILL_CPU")) : 13;
+    if (cpu >= 0) {
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      CPU_SET(cpu, &set);
+      if (pthread_setaffinity_np(pthread_self(), sizeof set, &set)) std::printf("serve: file writer not pinned\n");
+    }
+    for (;;) {
+      Job j;
+      {
+        std::unique_lock<std::mutex> l(mu_);
+        cv_.wait(l, [&] { return stop_ || !q_.empty(); });
+        if (q_.empty()) return;
+        j = q_.front();
+      }
+      if (j.rm) {
+        unlink(j.path.c_str());
+      } else {
+        std::string why;
+        if (!keepfile::write_atomic(j.path, j.bytes.data(), j.bytes.size(), &why))
+          std::printf("serve: %s: %s\n", j.path.c_str(), why.c_str());
+      }
+      {
+        std::lock_guard<std::mutex> l(mu_);
+        q_.pop_front();
+      }
+      cv_.notify_all();
+    }
+  }
+  std::string dir_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<Job> q_;
+  bool stop_ = false;
+  std::thread th_;
+};
+
+// DSGB10_COPY=0 (measurement only): no finished turn is written through, and a planned stop keeps
+// nothing; the engine's copies are the disk tier's write traffic, and this is the baseline without it.
+bool copy_on() {
+  static const bool on = [] {
+    const char* const v = getenv("DSGB10_COPY");
+    return !v || std::atoi(v) != 0;
+  }();
+  return on;
+}
+
+// <dir>/<id 16 hex>.<h>.<seq>.s
+std::string session_name(const std::string& dir, uint64_t id, int h, uint64_t seq) {
+  char b[80];
+  std::snprintf(b, sizeof b, "%016llx.%d.%llu.s", (unsigned long long)id, h, (unsigned long long)seq);
+  return dir + "/" + b;
+}
+
+// Session s's file: its header (the engine copy it goes with), then its history and its encoder-only
+// snapshots.
+std::vector<uint8_t> session_file(uint64_t run_id, uint64_t id, const Session& s, uint64_t seq) {
+  using keepfile::put;
+  std::vector<uint8_t> f(sizeof(SessHeader), 0);
+  for (const int32_t t : s.hist) put<int32_t>(f, t);
+  for (const int e : s.enc_snaps) put<int32_t>(f, e);
+  SessHeader hd{};
+  std::memcpy(hd.magic, kSessMagic, sizeof kSessMagic);
+  hd.run_id = run_id, hd.id = id, hd.h = s.h, hd.seq = seq;
+  hd.written = (int64_t)unix_now(), hd.used = s.used, hd.t_used = s.t_used;
+  hd.pe_snap = s.pe_snap, hd.end_lo = s.end_lo, hd.end_clo = s.end_clo, hd.end_w = s.end_w, hd.end_dec_lo = s.end_dec_lo;
+  hd.n_hist = (int32_t)s.hist.size(), hd.n_enc = (int32_t)s.enc_snaps.size();
+  hd.body_bytes = f.size() - sizeof hd;
+  hd.body_hash = keepfile::fnv(f.data() + sizeof hd, hd.body_bytes);
+  std::memcpy(f.data(), &hd, sizeof hd);
+  return f;
+}
+
+// One session file read and checked: its magic, its run id, its body's hash and its records. False with
+// why (the file is removed: a start keeps only what it can read).
+bool read_session(const std::string& path, uint64_t run_id, uint64_t* id, Session* s, std::string* why) {
+  std::vector<uint8_t> f;
+  if (!keepfile::read_private(path, 64u << 20, &f, why)) return false;
+  if (f.size() < sizeof(SessHeader)) return *why = path + ": too short", false;
+  SessHeader hd;
+  std::memcpy(&hd, f.data(), sizeof hd);
+  if (std::memcmp(hd.magic, kSessMagic, sizeof kSessMagic) != 0) return *why = path + ": not a session file", false;
+  if (hd.run_id != run_id) return *why = path + ": of another engine binary, weights or options", false;
+  if (hd.body_bytes != f.size() - sizeof hd || keepfile::fnv(f.data() + sizeof hd, hd.body_bytes) != hd.body_hash)
+    return *why = path + ": incomplete or damaged", false;
+  if (!hd.id || hd.h <= 0 || !hd.seq || hd.n_hist < 0 || hd.n_hist > (1 << 24) || hd.n_enc < 0 || hd.n_enc > 4096)
+    return *why = path + ": a bad header", false;
+  keepfile::Reader r{f.data() + sizeof hd, (size_t)hd.body_bytes};
+  s->h = hd.h, s->cseq = hd.seq, s->used = hd.used, s->t_used = hd.t_used;
+  s->pe_snap = hd.pe_snap;
+  s->end_lo = hd.end_lo, s->end_clo = hd.end_clo, s->end_w = hd.end_w, s->end_dec_lo = hd.end_dec_lo;
+  s->hist.resize(hd.n_hist);
+  for (int32_t& t : s->hist) t = r.get<int32_t>();
+  s->enc_snaps.resize(hd.n_enc);
+  for (int& x : s->enc_snaps) x = r.get<int32_t>();
+  if (!r.ok || r.at != r.n) return *why = path + ": a bad body", false;
+  for (const int32_t t : s->hist)
+    if (t < 0 || t >= model::kVocab) return *why = path + ": a token out of range", false;
+  *id = hd.id;
+  return true;
+}
 
 constexpr int kReplay = 128;          // CED's decoder replay
 constexpr int kNever = 1 << 30;       // Session::dec_lo of rings that are valid nowhere
@@ -445,6 +616,7 @@ struct Flight {
   int slices = 0, decoded = 0, batched = 0;  // runs; tokens decoded, of them in batches
   DecodeEnd de;                      // the slices' drafts, summed
   double spec_tok = 1, spec_ms = 0;  // the drafts' rate (SpecRate) from slice to slice
+  std::string err;                   // a run's error text (kEndPool): DONE's reason kError carries it
 };
 
 // b's drafts and steps added to a's (a request's decode slices)
@@ -459,15 +631,77 @@ void add(DecodeEnd& a, const DecodeEnd& b) {
   }
 }
 
+// The store's counters and the server's own, one JSON line each time (`--stats-file`, serve.h): rank 0
+// opens the file once, mode 0600, and appends a line every 600 s when a counter changed, and once at a
+// planned stop. Counts and flags only, never request content.
+class StatsFile {
+ public:
+  void open(const std::string& path) {
+    if (path.empty()) return;  // --stats-file not given
+    path_ = path;
+    fd_ = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+    if (fd_ < 0) std::printf("serve: stats file %s: %s\n", path.c_str(), std::strerror(errno));
+  }
+  // A line if `force`, or if 600 s have passed since the last one and a counter changed.
+  void maybe(const model::Model& m, size_t sessions, uint64_t frees_no_disk, double now, bool force) {
+    if (fd_ < 0) return;
+    if (!started_) started_ = true, t_last_ = now;
+    const model::StoreStats s = m.state_stats();
+    const bool changed = s.spills != last_.spills || s.spill_bytes != last_.spill_bytes ||
+                         s.unspills != last_.unspills || s.unspill_bytes != last_.unspill_bytes ||
+                         s.disk_drops != last_.disk_drops || s.kept_loaded != last_.kept_loaded ||
+                         s.cow != last_.cow || s.copies != last_.copies || s.copy_bytes != last_.copy_bytes ||
+                         s.recovered != last_.recovered || frees_no_disk != last_frees_;
+    if (!force && (now - t_last_ < 600.0 || !changed)) return;
+    t_last_ = now;
+    last_ = s, last_frees_ = frees_no_disk;
+    const double gib = 1073741824.0;
+    char line[768];
+    const int n = std::snprintf(
+        line, sizeof line,
+        "{\"t\": %.0f, \"sessions\": %zu, \"pool_gib\": %.3f, \"pool_cap_gib\": %.3f, \"disk_gib\": %.3f, "
+        "\"disk_cap_gib\": %.3f, \"spills\": %llu, \"spill_bytes\": %llu, \"unspills\": %llu, \"unspill_bytes\": %llu, "
+        "\"disk_drops\": %llu, \"kept_loaded\": %llu, \"cow\": %llu, \"copies\": %llu, \"copy_bytes\": %llu, "
+        "\"recovered\": %llu, \"frees_no_disk\": %llu}\n",
+        unix_now(), sessions, m.state_bytes() / gib, m.state_capacity() / gib, m.state_disk_bytes() / gib,
+        m.state_disk_capacity() / gib, (unsigned long long)s.spills, (unsigned long long)s.spill_bytes,
+        (unsigned long long)s.unspills, (unsigned long long)s.unspill_bytes, (unsigned long long)s.disk_drops,
+        (unsigned long long)s.kept_loaded, (unsigned long long)s.cow, (unsigned long long)s.copies,
+        (unsigned long long)s.copy_bytes, (unsigned long long)s.recovered, (unsigned long long)frees_no_disk);
+    if (n <= 0 || write(fd_, line, (size_t)n) != n) {
+      std::printf("serve: stats file %s: %s\n", path_.c_str(), std::strerror(errno));
+      close(fd_);  // one line on stderr, and the writer stops
+      fd_ = -1;
+    }
+  }
+
+ private:
+  int fd_ = -1;
+  bool started_ = false;
+  double t_last_ = 0;
+  model::StoreStats last_{};
+  uint64_t last_frees_ = 0;
+  std::string path_;
+};
+
 class Server {
  public:
   Server(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o, Io& io, size_t budget)
-      : m_(m), ring_(ring), wd_(wd), o_(o), io_(io), budget_(budget), slot_(m.slots(), 0) {}
+      : m_(m), ring_(ring), wd_(wd), o_(o), io_(io),
+        // --shared-kv: the pool is the sessions' pages, so the store's budget between requests is its
+        // size (serve()'s own budget is the pool less room for one long request); with the flag off
+        // this is serve()'s budget itself.
+        budget_(m.shared_kv() ? m.state_capacity() : budget),
+        fq_(o.keep_dir),
+        slot_(m.slots(), 0) {
+    stats_.open(o_.stats_file);
+  }
 
   // Requests let go after their session's last one ended first, then those that waited for a slot (when
   // one is there), then the front-end's frames, then a run of the requests decoding (run).
   void loop() {
     while (!g_stop) {
+      stats_.maybe(m_, sess_.size(), frees_no_disk_, now_s(), false);
       sweep();
       Event e;
       if (!ready_.empty()) {
@@ -495,86 +729,79 @@ class Server {
       for (const Request& rq : *d) done(rq, fe::kCancelled, 0, 0, now_s(), 0), Io::forget(rq);
       d->clear();
     }
-    keep();
+    flush();
+    stats_.maybe(m_, sess_.size(), frees_no_disk_, now_s(), true);
     bcast(ring_, Cmd{});  // stop the other ranks
   }
 
-  // The sessions an earlier run kept at its planned stop (keep), when the store reused that stop's
-  // files (Model::state_kept: the same generation): their histories and ranges from o_.keep_index, which
-  // goes once read, so that a crash from now on starts clean. Sessions it names that the store does not
-  // hold on disk, or unused for keep_age_s, are dropped, and so are the store's sessions it does not name.
-  void load_kept() {
-    if (o_.keep_index.empty()) return;
+  // The sessions an earlier run left in o_.keep_dir, when the engine recovered the copies their files
+  // name (Model::state_recover_take: the same run id and seq): their histories and ranges come back, so
+  // the front-end's session ids find them as before the stop. A file whose session the engine does not
+  // hold, whose copy seq differs, or that is unused for keep_age_s, goes; the store's sessions that no
+  // file names are freed. A crash from now on leaves the files, and the next start reads them again.
+  void load_recovered() {
+    if (o_.keep_dir.empty() || !copy_on()) {  // no history files to pair them with: the store's go
+      free_store_sessions();
+      return;
+    }
     const double t0 = now_s();
-    std::vector<uint8_t> f;
-    std::string why;
-    const bool got = keepfile::read_private(o_.keep_index, 16ull << 30, &f, &why);
-    unlink(o_.keep_index.c_str());
-    unlink((o_.keep_index + ".new").c_str());
-    const uint64_t gen = m_.state_kept();
-    std::map<uint64_t, Session> kept;
-    SrvHeader hd{};
-    if (got && f.size() >= sizeof hd) std::memcpy(&hd, f.data(), sizeof hd);
-    if (!got) {
-      // why: "" when there is none
-    } else if (!gen) {
-      why = "the store did not reuse its files";
-    } else if (f.size() < sizeof hd || std::memcmp(hd.magic, kSrvMagic, sizeof kSrvMagic) != 0 || hd.gen != gen ||
-               hd.body_bytes != f.size() - sizeof hd ||
-               keepfile::fnv(f.data() + sizeof hd, hd.body_bytes) != hd.body_hash || hd.n_sess < 0) {
-      why = "the index is not of the stop whose files the store reused";
-    } else {
-      keepfile::Reader r{f.data() + sizeof hd, (size_t)hd.body_bytes};
-      const double wall = unix_now();
-      for (int i = 0; i < hd.n_sess && r.ok; ++i) {
-        const uint64_t id = r.get<uint64_t>();
-        Session s;
-        s.h = r.get<int32_t>(), s.pe_snap = r.get<int32_t>();
-        s.end_lo = r.get<int32_t>(), s.end_clo = r.get<int32_t>(), s.end_w = r.get<int32_t>(), s.end_dec_lo = r.get<int32_t>();
-        s.used = r.get<uint64_t>();
-        s.t_used = r.get<double>();
-        const int nh = r.get<int32_t>(), ne = r.get<int32_t>();
-        if (!r.ok || nh < 0 || nh > o_.max_ctx || ne < 0 || ne > 4096) {
-          r.ok = false;
-          break;
-        }
-        s.hist.resize(nh);
-        for (int32_t& t : s.hist) t = r.get<int32_t>();
-        s.enc_snaps.resize(ne);
-        for (int& e : s.enc_snaps) e = r.get<int32_t>();
-        bool ok = r.ok && id && !kept.count(id) && s.h > 0 && wall - s.t_used <= o_.keep_age_s;
-        for (const int32_t t : s.hist) ok = ok && t >= 0 && t < model::kVocab;
-        const model::Model::StateInfo si = m_.state_info(s.h);
-        ok = ok && si.on_disk && si.saved <= nh && si.end_pos <= nh;
-        for (const auto& [k, x] : kept) ok = ok && x.h != s.h;
-        s.lo = s.clo = s.w = s.dec_lo = 0;  // nothing is live
-        if (ok) kept.emplace(id, std::move(s));
-      }
-      if (!r.ok || r.at != r.n) {
-        kept.clear();
-        why = "the index is damaged";
-      }
+    const uint64_t run_id = m_.state_run_id();
+    const double wall = unix_now();
+    DIR* d = opendir(o_.keep_dir.c_str());
+    if (!d) {
+      free_store_sessions();
+      return;
     }
-    // the store's sessions that no kept session names go
-    std::vector<StateOp> v;
-    std::set<int> named;
-    for (const auto& [id, s] : kept) named.insert(s.h);
-    int top = 0;
-    for (const int h : m_.state_sessions()) {
-      top = std::max(top, h);
-      if (!named.count(h)) v.push_back({kStFree, h, 0, 0});
-    }
-    if (!v.empty()) state(v);
-    next_h_ = std::max({next_h_, top + 1, kept.empty() ? 0 : hd.next_h});
-    for (auto& [id, s] : kept) clock_ = std::max(clock_, s.used);
+    int back = 0, dropped = 0;
     size_t positions = 0;
-    for (const auto& [id, s] : kept) positions += s.hist.size();
-    if (!kept.empty()) clock_ = std::max<uint64_t>(clock_, hd.clock);
-    sess_.insert(std::make_move_iterator(kept.begin()), std::make_move_iterator(kept.end()));
-    if (!why.empty() || !sess_.empty() || !v.empty())
-      std::printf("serve: kept sessions: %zu back (%zu positions, %.2f GiB on disk), %zu of the store's dropped, in %.1f ms%s%s\n",
-                  sess_.size(), positions, m_.state_disk_bytes() / 1073741824.0, v.size(), 1e3 * (now_s() - t0),
-                  why.empty() ? "" : "; ", why.c_str());
+    std::set<int> have;
+    for (struct dirent* e; (e = readdir(d));) {
+      const std::string name = e->d_name;
+      const std::string path = o_.keep_dir + "/" + name;
+      if (name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) {
+        unlink(path.c_str());
+        continue;
+      }
+      if (name.size() < 3 || name.compare(name.size() - 2, 2, ".s") != 0) continue;
+      Session s;
+      uint64_t id = 0;
+      std::string why;
+      if (!read_session(path, run_id, &id, &s, &why)) {
+        unlink(path.c_str());
+        ++dropped;
+        continue;
+      }
+      const model::Model::StateInfo si = m_.state_info(s.h);
+      if (s.hist.size() > (size_t)o_.max_ctx || si.copy_seq != s.cseq || !si.on_disk ||
+          si.saved > (int)s.hist.size() || si.end_pos > (int)s.hist.size() || wall - s.t_used > o_.keep_age_s ||
+          have.count(s.h)) {
+        unlink(path.c_str());
+        ++dropped;
+        continue;
+      }
+      s.lo = s.clo = s.w = s.dec_lo = 0;  // nothing is live
+      have.insert(s.h);
+      next_h_ = std::max(next_h_, s.h + 1);
+      clock_ = std::max(clock_, s.used);
+      positions += s.hist.size();
+      sess_.emplace(id, std::move(s));
+      ++back;
+    }
+    closedir(d);
+    std::vector<StateOp> v;
+    for (const int h : m_.state_sessions())
+      if (!have.count(h)) v.push_back({kStFree, h, 0, 0});
+    if (!v.empty()) state(v);
+    if (dropped || back || !v.empty())
+      std::printf("serve: sessions on disk: %d back (%zu positions, %.2f GiB), %d files dropped, %zu of the store's "
+                  "freed, in %.1f ms\n",
+                  back, positions, m_.state_disk_bytes() / 1073741824.0, dropped, v.size(), 1e3 * (now_s() - t0));
+  }
+  // Every session the store holds freed (recovered copies the server cannot name: their h would be reused).
+  void free_store_sessions() {
+    std::vector<StateOp> v;
+    for (const int h : m_.state_sessions()) v.push_back({kStFree, h, 0, 0});
+    if (!v.empty()) state(v);
   }
 
  private:
@@ -598,78 +825,66 @@ class Server {
       issue(c);
     }
   }
-  // A planned stop (SIGTERM): the sessions kept for the next start (load_kept; docs/engine.md). The slots'
-  // sessions' states go to the store; sessions unused for keep_age_s are freed; those in device memory
-  // are spilled to the disk tier, the most recently used first, as far as keep_bytes goes (the rest
-  // freed); then every rank syncs its file and writes its index (kStKeep), and this server the kept
-  // sessions' histories with the same generation. Spilling may drop the file's least recently used
-  // sessions to make room (forget_evicted).
-  void keep() {
-    if (!o_.keep_bytes || o_.keep_index.empty()) return;
+  // A planned stop (SIGTERM, docs/engine.md "The disk tier"): every finished turn is already on the
+  // disk (copy_session), so this only makes what is in device memory one too. The slots' sessions go to
+  // the store; sessions unused for keep_age_s are freed; every other session is written through
+  // (kStCopy); every copy is synced (kStSync); the histories are queued beside them and the queue is
+  // drained; then the ranks stop together (loop). A session with no copy of what it holds now is freed.
+  void flush() {
+    if (o_.keep_dir.empty() || !copy_on()) return;
     const double t0 = now_s(), wall = unix_now();
     for (int s = 0; s < (int)slot_.size(); ++s) persist_slot(s, true);
     std::vector<StateOp> v;
-    std::vector<std::pair<uint64_t, uint64_t>> ram;  // (used, id): the sessions in device memory
-    int old = 0, before = 0;
+    int old = 0;
     for (auto it = sess_.begin(); it != sess_.end();) {
       if (wall - it->second.t_used > o_.keep_age_s) {
+        forget_session(it->first, it->second);
         v.push_back({kStFree, it->second.h, 0, 0});
         it = sess_.erase(it);
         ++old;
         continue;
       }
-      if (m_.state_info(it->second.h).on_disk) ++before;
-      else ram.emplace_back(it->second.used, it->first);
+      v.push_back({kStCopy, it->second.h, 0, 0});
       ++it;
     }
-    std::sort(ram.rbegin(), ram.rend());
-    size_t bytes = 0;
-    int spilled = 0, freed = 0;
-    for (const auto& [used, id] : ram) {
-      const Session& s = sess_.at(id);
-      const size_t b = m_.state_info(s.h).bytes;
-      if (bytes + b <= o_.keep_bytes) {
-        v.push_back({kStSpill, s.h, 0, 0});
-        bytes += b, ++spilled;
-      } else {
-        v.push_back({kStFree, s.h, 0, 0});
-        sess_.erase(id);
-        ++freed;
-      }
-    }
     state(v);
-    forget_evicted();  // dropped from the file to make room
-    uint64_t gen = rng_();
-    gen += !gen;
-    state({{kStKeep, -1, (int32_t)(uint32_t)gen, (int32_t)(uint32_t)(gen >> 32)}});
+    forget_evicted();  // a copy's room may have dropped sessions from the file
+    state({{kStSync, -1, 0, 0}});
     const double t1 = now_s();
-    std::vector<uint8_t> f(sizeof(SrvHeader));
-    using keepfile::put;
     int n = 0;
-    for (const auto& [id, s] : sess_) {
-      if (!m_.state_info(s.h).on_disk) continue;
+    for (auto& [id, s] : sess_) {
+      const uint64_t k = m_.state_info(s.h).copy_seq;
+      if (!k) continue;
+      if (k != s.cseq) {
+        fq_.write(session_name(o_.keep_dir, id, s.h, k), session_file(m_.state_run_id(), id, s, k));
+        if (s.cseq) fq_.remove(session_name(o_.keep_dir, id, s.h, s.cseq));
+        s.cseq = k;
+      }
       ++n;
-      put<uint64_t>(f, id), put<int32_t>(f, s.h), put<int32_t>(f, s.pe_snap);
-      put<int32_t>(f, s.end_lo), put<int32_t>(f, s.end_clo), put<int32_t>(f, s.end_w), put<int32_t>(f, s.end_dec_lo);
-      put<uint64_t>(f, s.used), put<double>(f, s.t_used);
-      put<int32_t>(f, (int32_t)s.hist.size()), put<int32_t>(f, (int32_t)s.enc_snaps.size());
-      for (const int32_t t : s.hist) put<int32_t>(f, t);
-      for (const int e : s.enc_snaps) put<int32_t>(f, e);
     }
-    SrvHeader hd{};
-    std::memcpy(hd.magic, kSrvMagic, sizeof kSrvMagic);
-    hd.gen = gen, hd.written = (int64_t)unix_now(), hd.n_sess = n, hd.next_h = next_h_, hd.clock = clock_;
-    hd.body_bytes = f.size() - sizeof hd;
-    hd.body_hash = keepfile::fnv(f.data() + sizeof hd, hd.body_bytes);
-    std::memcpy(f.data(), &hd, sizeof hd);
-    std::string why;
-    const bool ok = keepfile::write_atomic(o_.keep_index, f.data(), f.size(), &why);
-    std::printf("serve: kept sessions: %d for the next start (%d on disk before, %d spilled now: %.2f GiB; %d freed past "
-                "%.1f GiB, %d unused for %.0f days), the ranks' files synced and indexed in %.2f s; histories %.1f KiB "
-                "in %.1f ms%s%s\n",
-                ok ? n : 0, before, spilled, bytes / 1073741824.0, freed, o_.keep_bytes / 1073741824.0, old,
-                o_.keep_age_s / 86400, t1 - t0, f.size() / 1024.0, 1e3 * (now_s() - t1), ok ? "" : ": NOT WRITTEN, ",
-                why.c_str());
+    fq_.drain();
+    std::printf("serve: sessions on disk for the next start: %d (%.2f GiB), synced in %.2f s; %d unused for %.0f "
+                "days\n", n, m_.state_disk_bytes() / 1073741824.0, now_s() - t0, old, o_.keep_age_s / 86400);
+  }
+
+  // The session's history file goes (its state is gone here too): the engine's copy is removed by the
+  // state operation that follows, and a start that finds the file with no copy drops it.
+  void forget_session(uint64_t id, const Session& s) {
+    if (copy_on() && s.cseq) fq_.remove(session_name(o_.keep_dir, id, s.h, s.cseq));
+  }
+
+  // The finished turn written through: the session's working state into the store, a copy of it in the
+  // disk tier (kStCopy), and its history beside it (a write, and a removal of the file it replaces).
+  void copy_session(uint64_t id, Session* S) {
+    if (!copy_on() || !S || o_.keep_dir.empty()) return;
+    if (S->slot >= 0) persist_slot(S->slot, false);
+    state({{kStCopy, S->h, 0, 0}});
+    forget_evicted();  // the copy's room may have dropped sessions from the file
+    const uint64_t k = m_.state_info(S->h).copy_seq;
+    if (!k || k == S->cseq) return;
+    fq_.write(session_name(o_.keep_dir, id, S->h, k), session_file(m_.state_run_id(), id, *S, k));
+    if (S->cseq) fq_.remove(session_name(o_.keep_dir, id, S->h, S->cseq));
+    S->cseq = k;
   }
 
   // Operations that move session x's working state (its slot's) into the store: its compressed caches as
@@ -705,6 +920,7 @@ class Server {
   void release(uint64_t id) {
     const auto it = sess_.find(id);
     if (it == sess_.end()) return;
+    forget_session(id, it->second);
     state({{kStFree, it->second.h, 0, 0}});
     if (it->second.slot >= 0) slot_[it->second.slot] = 0;
     sess_.erase(it);
@@ -721,6 +937,18 @@ class Server {
     s.enc_snaps.erase(std::remove_if(s.enc_snaps.begin(), s.enc_snaps.end(), gone), s.enc_snaps.end());
     if (!v.empty()) state(v);
   }
+  // --shared-kv (docs/shared-kv.md §2.5): the flag decides the store's budget between requests and
+  // whether a loop's evictions must be collected at once.
+  bool shared_kv() const { return m_.shared_kv(); }
+  // The pool's refusal: what a request whose step or chunk the pool cannot hold ends with (DONE reason
+  // kError; the front end reports it as any engine error).
+  std::string pool_full(uint64_t id, int pos) const {
+    char b[192];
+    std::snprintf(b, sizeof b, "the shared KV pool is full (%.2f of %.2f GiB in use; session %016llx needs a page "
+                  "for position %d)", m_.state_bytes() / 1073741824.0, m_.state_capacity() / 1073741824.0,
+                  (unsigned long long)id, pos);
+    return b;
+  }
   // Sessions the store evicted to make room (an operation found its pool full) are gone here too.
   void forget_evicted() {
     for (const int h : m_.state_evicted())
@@ -728,6 +956,7 @@ class Server {
         if (it->second.h == h) {
           std::printf("serve: session %016llx evicted to make room\n", (unsigned long long)it->first);
           if (it->second.slot >= 0) slot_[it->second.slot] = 0;
+          forget_session(it->first, it->second);
           sess_.erase(it);
           break;
         }
@@ -760,6 +989,7 @@ class Server {
       v.push_back({kStFree, victim->second.h, 0, 0});
       if (victim->second.slot >= 0) slot_[victim->second.slot] = 0;
       sess_.erase(victim);
+      ++frees_no_disk_;
     }
     if (!v.empty()) state(v);
     forget_evicted();  // dropped from the disk tier to make room
@@ -989,6 +1219,17 @@ class Server {
         }
       }
       std::printf("serve: req %llu restart: %s; reused %d (%s)\n", (unsigned long long)h.req_id, from, q, kHow[pl.how]);
+      if (FILE* const sub = submit_log()) {  // DSGB10_SUBMIT_LOG (measurement only): the plan and the prompt's ids
+        std::fprintf(sub, "{\"t\":%llu,\"req\":%llu,\"sess\":\"%016llx\",\"base\":", (unsigned long long)now_ns(),
+                     (unsigned long long)h.req_id, (unsigned long long)h.session_id);
+        if (h.base_session_id) std::fprintf(sub, "\"%016llx\"", (unsigned long long)h.base_session_id);
+        else std::fprintf(sub, "null");
+        // "cached": the prompt tokens whose state was reused (DONE's cached_tokens: the restart point)
+        std::fprintf(sub, ",\"slot\":%d,\"n\":%d,\"q\":%d,\"cached\":%d,\"ids\":[", s, n, q, q);
+        for (int k = 0; k < n; ++k) std::fprintf(sub, "%s%d", k ? "," : "", prompt[k]);
+        std::fprintf(sub, "]}\n");
+        std::fflush(sub);
+      }
     }
     std::vector<StateOp> v;
     if (slot_[s] && slot_[s] != h.session_id) {  // the slot's session (a fork's base too) keeps its state in the store
@@ -1003,6 +1244,9 @@ class Server {
       ns.h = next_h_++;
       S = &sess_.emplace(h.session_id, std::move(ns)).first->second;
     }
+    // Its copy does not cover what a restart at q rewrites: a run that continues a session with one says
+    // so first, so the copy a crash leaves is not mistaken for the session's state (state_copy).
+    if (m_.state_info(S->h).copy_seq) v.push_back({kStInval, S->h, q, 0});
     if (src) {
       if (!src_live && q > 0) v.push_back({kStLoad, src->h, q, 0});
       if (pl.how == kSnap) v.push_back({kStRestore, src->h, pl.snap, 0});
@@ -1056,7 +1300,7 @@ class Server {
         for (int k = std::max<int>(sp.start, c.pos0); k < (int)(sp.start + sp.rows); ++k) t[k - c.pos0] = -1;
       bcast_payload(ring_, t.data(), t.size() * 4, 0);
       m_.set_tokens(c.pos0, c.n, t.data());
-      if (!f.rq.spans.empty()) images(f.rq);
+      if (!f.rq.spans.empty()) images(f.rq, c.pos0);
       tu.ops_ms = 1e3 * (now_s() - (resume ? t0 : f.t_start));
     }
     // ---- prefill [q, n): chunks of prefill_rows; a short remainder as one step
@@ -1087,7 +1331,13 @@ class Server {
         c.op = kCmdRows;
         std::copy(prompt.begin() + pos, prompt.begin() + pos + R, c.tokens);
         issue(c);
-        const uint64_t k = run_rows(m_, c);
+        bool pool = false;
+        const uint64_t k = run_rows(m_, c, &pool);
+        if (pool) {  // no page for the step: not launched, the request ends with the pool's text (§2.5)
+          wd_.started = 0;
+          f.err = pool_full(h.session_id, c.pos0 + c.rows - 1);
+          return ended(f, fe::kError);
+        }
         first = m_.wait(k);
         tu.rows_ms += m_.last_gpu_ms();
         first_row = R - 1;
@@ -1100,7 +1350,13 @@ class Server {
         for (int i = 0; i < c.n_snaps; ++i)
           if (ced && c.snaps[i] < n) S->enc_snaps.push_back(c.snaps[i]);  // the replay covers only one at n
         issue(c);
-        const uint64_t k = run_prefill(m_, c);
+        bool pool = false;
+        const uint64_t k = run_prefill(m_, c, &pool);
+        if (pool) {  // no page for the chunk: not launched, the request ends with the pool's text (§2.5)
+          wd_.started = 0;
+          f.err = pool_full(h.session_id, c.pos0 + c.rows - 1);
+          return ended(f, fe::kError);
+        }
         if (k != ~0ull) first = m_.wait(k), first_row = 0;
         if (!last) m_.drain();  // the last chunk's tail (the draft windows' seeding) drains after tok0 is out
         if (!last) tu.add_split(m_);
@@ -1157,22 +1413,35 @@ class Server {
     return true;
   }
 
-  // Vision: rq's spans and rows to every rank (kCmdImages), for the prefill chunks that follow.
-  void images(const Request& rq) {
+  // Vision: rq's spans that end after `from` (the first position this run computes) and their rows to every
+  // rank (kCmdImages), for the prefill chunks that follow. A span wholly before `from` is in the reused state
+  // already, so a turn that resends a conversation's images ships none of their rows.
+  void images(const Request& rq, int from) {
     const double t0 = now_s();
+    std::vector<int32_t> lo, hi;
+    std::vector<uint16_t> rows;
+    size_t off = 0;
+    for (const fe::ImageSpan& sp : rq.spans) {
+      const size_t len = (size_t)sp.rows * fe::kImageDim;
+      if ((int)(sp.start + sp.rows) > from) {
+        lo.push_back((int32_t)sp.start), hi.push_back((int32_t)(sp.start + sp.rows));
+        rows.insert(rows.end(), rq.img.begin() + off, rq.img.begin() + off + len);
+      }
+      off += len;
+    }
+    if (lo.empty()) return;  // every image is before the restart: the chunks need none
     Cmd c{};
     c.op = kCmdImages;
-    c.n = (int)rq.spans.size();
+    c.n = (int)lo.size();
     issue(c);
-    std::vector<int32_t> lh(2 * rq.spans.size());
-    for (size_t i = 0; i < rq.spans.size(); ++i)
-      lh[i] = (int32_t)rq.spans[i].start, lh[rq.spans.size() + i] = (int32_t)(rq.spans[i].start + rq.spans[i].rows);
+    std::vector<int32_t> lh(lo);
+    lh.insert(lh.end(), hi.begin(), hi.end());
     bcast_payload(ring_, lh.data(), lh.size() * 4, 0);
-    std::vector<uint16_t> rows(rq.img);
     bcast_payload(ring_, rows.data(), rows.size() * 2, 0);
     m_.set_images(c.n, lh.data(), lh.data() + c.n, rows.data());
-    std::printf("serve: req %llu images: %d spans, %zu rows, sent to every rank in %.1f ms\n",
-                (unsigned long long)rq.h.req_id, c.n, rows.size() / fe::kImageDim, 1e3 * (now_s() - t0));
+    std::printf("serve: req %llu images: %d of %zu spans, %zu rows, sent to every rank in %.1f ms\n",
+                (unsigned long long)rq.h.req_id, c.n, rq.spans.size(), rows.size() / fe::kImageDim,
+                1e3 * (now_s() - t0));
   }
 
   bool ended(Flight& f, uint32_t why) {
@@ -1319,6 +1588,9 @@ class Server {
       }
     });
     if (ctl) m_.set_ctl(0);
+    // --shared-kv: the loop's room calls may have evicted stored sessions, and a step whose page the pool
+    // could not hold ends the request with the pool's text (docs/shared-kv.md §2.5).
+    if (shared_kv()) forget_evicted();
     f.dec_s += now_s() - t_dec;
     f.decoded += e.sampled;
     f.spec_tok = e.spec_tok, f.spec_ms = e.spec_ms;
@@ -1328,6 +1600,10 @@ class Server {
     if (e.fed > 0) {  // the history: the token it started from, and the samples fed after it
       S->hist.push_back(c.tokens[0]);
       S->hist.insert(S->hist.end(), samples.begin(), samples.begin() + std::max(0, e.fed - 1));
+    }
+    if (e.why == kEndPool) {
+      f.err = pool_full(h.session_id, c.pos0 + e.fed);
+      return fe::kError;
     }
     // a pause's last token may be a stop id (the control word ends the loop before it checks them)
     return cancel || (e.why == kEndCancel && !pause) ? fe::kCancelled
@@ -1409,6 +1685,9 @@ class Server {
       end = batch_loop(m_, c, e, wd_, cb);
     }
     if (ctl) m_.set_ctl(0);
+    // --shared-kv: the loop's room calls may have evicted stored sessions, and an entry whose rows the pool
+    // could not hold ends with the pool's text (docs/shared-kv.md §2.5).
+    if (shared_kv()) forget_evicted();
     const double dt = now_s() - t_dec;
     std::string ends;
     for (int k = 0; k < n; ++k) {
@@ -1429,7 +1708,9 @@ class Server {
         S[k]->hist.insert(S[k]->hist.end(), samples[k].begin(), samples[k].begin() + std::max(0, x.fed - 1));
       }
       const int max_new = (int)f.rq.h.max_new_tokens;
-      why[k] = cancel[k] || x.why == kEndCancel                ? fe::kCancelled
+      if (x.why == kEndPool) f.err = pool_full(f.rq.h.session_id, e[k].pos0 + x.fed);
+      why[k] = x.why == kEndPool                              ? fe::kError
+               : cancel[k] || x.why == kEndCancel             ? fe::kCancelled
                : x.why == kEndStop || stop_id(f, f.out.back()) ? fe::kStop
                : x.why == kEndContext                          ? fe::kContext
                : (int)f.out.size() >= max_new                  ? fe::kLength
@@ -1438,7 +1719,8 @@ class Server {
       char b[64];
       std::snprintf(b, sizeof b, "%s%llu %d %s", k ? ", " : "", (unsigned long long)f.rq.h.req_id, x.sampled,
                     why[k] == kPaused ? "paused" : why[k] == kTurn ? "turn" : why[k] == fe::kStop ? "stop"
-                    : why[k] == fe::kLength ? "length" : why[k] == fe::kCancelled ? "cancelled" : "context");
+                    : why[k] == fe::kLength ? "length" : why[k] == fe::kCancelled ? "cancelled"
+                    : why[k] == fe::kError ? "error" : "context");
       ends += b;
     }
     // the run for the log: its steps' median (g_t_wait: when each step's samples came); with drafts, the
@@ -1492,7 +1774,7 @@ class Server {
   // requests held for the session go on.
   void finish(Flight& f, uint32_t why) {
     const fe::SubmitHeader& h = f.rq.h;
-    done(f.rq, why, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
+    done(f.rq, why, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first, f.err);
     Io::forget(f.rq);
     const double t_end = now_s();
     flying_.erase(h.session_id);
@@ -1525,7 +1807,8 @@ class Server {
                 1e3 * (f.t_first > 0 ? f.t_first - f.t_start : 0.0),
                 (h.n_prompt - f.q) / std::max(1e-9, f.t_first - f.t_start), f.out.size(), 1e3 * t_dec,
                 f.decoded / std::max(1e-9, t_dec),
-                why == fe::kStop ? "stop" : why == fe::kLength ? "length" : why == fe::kCancelled ? "cancelled" : "context",
+                why == fe::kStop ? "stop" : why == fe::kLength ? "length" : why == fe::kCancelled ? "cancelled"
+                : why == fe::kError ? "error" : "context",
                 m_.state_bytes() / 1048576.0, S ? (int)S->hist.size() : 0, si.bytes / 1048576.0, si.snaps.size(), sl);
     const Turn& u = f.tu;
     std::printf("serve: req %llu turn: state ops %.1f ms (GPU %.1f), %d chunks: layers 0-19 %.1f ms, replay %.1f ms, "
@@ -1534,6 +1817,7 @@ class Server {
                 (unsigned long long)h.req_id, u.ops_ms, u.ops_gpu_ms, u.chunks, u.pf[0], u.pf[1], u.pf[2], u.pf[3],
                 u.rows_ms, u.tail_ms, u.dec1_ms);
     if (!S) release(h.session_id);
+    copy_session(h.session_id, S);  // the finished turn written through (before evict frees anything)
     for (auto it = held_.begin(); it != held_.end();)  // the session's held requests go on, in order
       if (it->h.session_id == h.session_id) ready_.push_back(std::move(*it)), it = held_.erase(it);
       else ++it;
@@ -1550,7 +1834,10 @@ class Server {
   Watchdog& wd_;
   const ServeOptions& o_;
   Io& io_;
+  StatsFile stats_;         // --stats-file: the counters' line
+  uint64_t frees_no_disk_ = 0;  // sessions freed by evict() without a disk tier
   const size_t budget_;  // the store's bytes kept between requests (the rest: room for the next one)
+  FileQueue fq_;         // the sessions' history files (server.<tag>.d), one thread, in order
   std::map<uint64_t, Session> sess_;
   std::vector<uint64_t> slot_;  // the session whose working state each slot holds (0: none)
   std::deque<Flight> rot_;      // requests between their first token and their end, in turn
@@ -1565,6 +1852,7 @@ class Server {
 }  // namespace
 
 int serve(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o) {
+  submit_log();  // DSGB10_SUBMIT_LOG: opened once here, not per request (nothing at all when unset)
   if (o.prefill_rows / o.snap_every > kMaxSnaps) die("serve: more than %d snapshots per prefill chunk", kMaxSnaps);
   signal(SIGPIPE, SIG_IGN);
   signal(SIGINT, on_signal);
@@ -1575,8 +1863,11 @@ int serve(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o
   hi.vocab_size = model::kVocab;
   hi.eos_id = 1;
   // between requests the store keeps at most its pool less room for one long request (a 64k-position
-  // one holds ~0.25 GiB); a request that needs more evicts in the store (model.h state_reserve)
-  const size_t cap = std::min(o.budget, m.state_capacity()), room = std::max<size_t>(256ull << 20, cap / 16);
+  // one holds ~0.25 GiB); a request that needs more evicts in the store (model.h state_reserve).
+  // --shared-kv: the pool's pages are the sessions' state and its room calls evict inside a request, so
+  // the budget between requests is the pool itself (T4's budget_), and this is the number logged.
+  const size_t cap = m.shared_kv() ? m.state_capacity() : std::min(o.budget, m.state_capacity());
+  const size_t room = m.shared_kv() ? 0 : std::max<size_t>(256ull << 20, cap / 16);
   const size_t budget = cap > room ? cap - room : 0;
   hi.max_sessions = (uint32_t)std::max<size_t>(1, budget / (64ull << 20));
   hi.name_len = (uint32_t)o.name.size();
@@ -1584,7 +1875,7 @@ int serve(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o
   std::printf("serve: listening on %s (context %d, session store %.2f GiB, kept between requests %.2f GiB)\n",
               o.socket.c_str(), o.max_ctx, m.state_capacity() / 1073741824.0, budget / 1073741824.0);
   Server s(m, ring, wd, o, io, budget);
-  s.load_kept();
+  s.load_recovered();
   s.loop();
   if (g_prof) CUDA_CHECK(cudaProfilerStop());
   std::printf("serve: stopped\n");

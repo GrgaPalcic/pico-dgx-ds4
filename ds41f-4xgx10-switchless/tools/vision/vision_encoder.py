@@ -13,7 +13,11 @@ them in place of the token embeddings at the span's positions (prefill only).
 Protocol (TCP, 127.0.0.1 only): request  = u32 len, JSON {"images": [record, ...]}
                                 reply    = u32 len, JSON {"ok", "error", "images": [{rows, hash, ...}]},
                                            u64 len, the rows of every image, bf16, in order.
-A record is what encoding.py's image blocks give: {"url": data-URL | http(s) URL} or {"data": b64}.
+A record is what encoding.py's image blocks give: {"url": data-URL | http(s) URL} or {"data": b64}. With
+--no-fetch an http(s) URL is refused: the images arrive inline as data: URLs only.
+
+The span rows of an image are kept by the sha256 of its raw bytes (--cache-mib, 0 turns the cache off), so an
+image that comes back in a later turn is not encoded again: its record then carries "cached": true and ms 0.0.
 """
 
 import argparse
@@ -31,6 +35,8 @@ from types import SimpleNamespace
 import torch
 from PIL import Image
 
+from rows_cache import RowsCache  # next to this file: the docker mount is tools/vision
+
 Image.MAX_IMAGE_PIXELS = 40_000_000  # PIL refuses images over twice this (decompression bombs)
 
 p = argparse.ArgumentParser()
@@ -39,7 +45,9 @@ p.add_argument("--host", default="127.0.0.1")
 p.add_argument("--port", type=int, default=18950)
 p.add_argument("--max-images", type=int, default=16)
 p.add_argument("--max-bytes", type=int, default=32 << 20)  # per fetched image
+p.add_argument("--no-fetch", action="store_true")          # refuse http(s) URLs: inline data: URLs only
 p.add_argument("--idle-unload-s", type=float, default=0)   # 0: keep the weights resident
+p.add_argument("--cache-mib", type=int, default=1024)      # cap on the span rows kept by image hash; 0: no cache
 a = p.parse_args()
 
 sys.path.insert(0, os.path.join(a.model, "inference"))
@@ -74,6 +82,7 @@ assert args.vision_n_layers > 0
 
 _model = None
 _lock = threading.Lock()
+_cache = RowsCache(a.cache_mib << 20)
 _last = time.time()
 
 
@@ -126,6 +135,8 @@ def fetch(record):
     """Image bytes from a record (image_processor.load_image_bytes, with a size cap for URLs)."""
     url = record.get("url")
     if isinstance(url, str) and url.startswith(("http://", "https://")):
+        if a.no_fetch:
+            raise ValueError("http(s) image URLs are turned off on this server: send the image inline as a data: URL")
         from urllib.parse import urlsplit
         from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -180,14 +191,22 @@ def handle(req):
         for r in recs:
             t0 = time.time()
             raw = fetch(r)
+            h = hashlib.sha256(raw).digest()
+            hit = _cache.get(h)
+            if hit is not None:  # the same image bytes were encoded before: the rows are the reply
+                rows_bytes, rows, g = hit
+                blobs.append(rows_bytes)
+                out.append({"rows": rows, "hash": int.from_bytes(h[:8], "little"), "grid": g, "ms": 0.0,
+                            "bytes": len(raw), "cached": True})
+                continue
             span, g = encode(raw)
             torch.cuda.synchronize()
             ms = 1e3 * (time.time() - t0)
-            blobs.append(span.view(torch.int16).cpu().numpy().tobytes())
-            h = hashlib.sha256(raw).digest()
+            rows_bytes = span.view(torch.int16).cpu().numpy().tobytes()
+            _cache.put(h, rows_bytes, span.shape[0], g)
+            blobs.append(rows_bytes)
             out.append({"rows": span.shape[0], "hash": int.from_bytes(h[:8], "little"), "grid": g, "ms": round(ms, 1),
                         "bytes": len(raw)})
-            log(f"image {len(raw)} B -> {g[2]}x{g[3]} tokens ({span.shape[0]} rows) in {ms:.0f} ms")
     return out, b"".join(blobs)
 
 
@@ -216,7 +235,7 @@ class H(socketserver.BaseRequestHandler):
                 imgs, data = handle(json.loads(recv_exact(s, n)))
                 hdr = {"ok": True, "images": imgs}
             except Exception as e:  # noqa: BLE001  (the error goes back to the client as a 400)
-                log("error:", repr(e))
+                log("error:", type(e).__name__)
                 hdr, data = {"ok": False, "error": str(e)[:500]}, b""
             _last = time.time()
             j = json.dumps(hdr).encode()

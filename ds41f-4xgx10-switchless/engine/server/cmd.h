@@ -15,6 +15,7 @@
 namespace srv {
 
 double now_s();
+uint64_t now_ns();  // CLOCK_REALTIME in ns: the step and submit logs' "t", comparable across ranks
 void pin_self(int cpu);
 
 // Aborts the process when a step hangs (a collective waiting on a dead peer spins forever).
@@ -40,7 +41,9 @@ enum : int32_t {
   kStSnap,         // state_snap(h, a)
   kStSpill,        // state_spill(h)
   kStUnspill,      // state_unspill(h)
-  kStKeep,         // state_keep(gen): a planned stop's kept sessions (gen = a | b << 32)
+  kStCopy,         // state_copy(h): a finished turn written through to its copy (its index file)
+  kStInval,        // state_inval(h, a): what h holds from position a on is about to be rewritten
+  kStSync,         // state_sync(): every copy in the file and on the disk (a planned stop)
 };
 struct StateOp {
   int32_t op = 0, h = -1, a = 0, b = 0;
@@ -120,10 +123,13 @@ void bcast_payload(comm::Ring& ring, void* data, size_t nbytes, int rank);
 model::Ctl to_ctl(const Cmd& c);
 
 // A prefill chunk on this rank (every rank alike): positions [pos0, pos0 + rows) of the tokens set
-// before; with kPfSample the last row is sampled (the step's number), else ~0.
-uint64_t run_prefill(model::Model& m, const Cmd& c);
-// kCmdRows on this rank: the step's number (wait() for it); the snapshots are queued behind it.
-uint64_t run_rows(model::Model& m, const Cmd& c);
+// before; with kPfSample the last row is sampled (the step's number), else ~0. With --shared-kv, false
+// in *pool when the pool has no page for the chunk: it is not launched and the request ends with the
+// error of docs/shared-kv.md §2.5 (the caller's; every rank decides alike, so every rank skips it).
+uint64_t run_prefill(model::Model& m, const Cmd& c, bool* pool = nullptr);
+// kCmdRows on this rank: the step's number (wait() for it); the snapshots are queued behind it. With
+// --shared-kv, false in *pool when the pool has no page for the step: it is not launched.
+uint64_t run_rows(model::Model& m, const Cmd& c, bool* pool = nullptr);
 
 // The decode loop, run by every rank alike. Step i feeds token tok_i at position pos0 + i (tok_0 =
 // c.tokens[0]) and samples tok_{i+1}; step i + 1 is queued before step i ends, with its token left
@@ -134,7 +140,7 @@ uint64_t run_rows(model::Model& m, const Cmd& c);
 // emits its accepted drafts and the token after them, and chooses the next step's rows, which is queued
 // before it ends with its rows left to the device. Stops act per token: what follows a stop token in
 // its step is dropped.
-enum : uint32_t { kEndStop, kEndLength, kEndCancel, kEndContext, kEndPause };
+enum : uint32_t { kEndStop, kEndLength, kEndCancel, kEndContext, kEndPause, kEndPool };
 struct DecodeEnd {
   int sampled = 0;     // tokens sampled: tok_1 .. tok_sampled
   int fed = 0;         // positions pos0 .. pos0 + fed - 1 hold the KV of tok_0 .. tok_{fed-1} now

@@ -1,3 +1,54 @@
+# pico-dgx-ds4, shared-KV fork
+
+An explicit fork of [Picom-code/pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4), itself a fork of Andy
+Shu's [blaesus/dsgb10](https://github.com/blaesus/dsgb10). MIT, as upstream. Everything below this section is
+upstream's README, unchanged except where our changes needed a line.
+
+## What this fork adds
+
+- **One shared KV pool** (`--shared-kv`): a live slot reserves 5.9 MiB instead of up to 895.4 MiB at 1M context.
+  Every slot and every stored session takes 3.5 MiB pages from one pool a box; taking a slot or moving a session
+  copies nothing, and a fork shares its parent's pages (copy-on-write).
+- **Sessions that survive a crash**: every finished turn is written through to the NVMe disk tier (`--disk-gib`), so
+  a `kill -9` loses at most the turn in flight.
+- **A served exactness gate**, `ds41f-4xgx10-switchless/bench/share_gate.py`: concurrent replies against cold replies
+  from a fresh engine, a resumed session against a fresh one, forks.
+- **Images**: inline images only, a turn with an image reuses the cached prefix, and an encoder cache for image rows.
+- **The sampler fix**: the Gumbel noise stays finite (its uniform never reaches 1).
+- **Diagnostics**: route and prefill dumps, token ids in the step log, store counters and a traffic file.
+
+## Run it
+
+Build exactly as upstream's "run it" section below, then start the engine with:
+
+```
+FLEET=~/fleet.conf DSGB10_ENGINE_ARGS="--max-ctx 1048576 --slots 16 --shared-kv --session-gib 17 --setenv DSGB10_BUDGET=1 --draft-head4 --draft-markov8 --setenv DSGB10_HEAD4_C1=1 --setenv DSGB10_CF_MLP=$HOME/cfmlp_cml.bin --setenv DSGB10_CF_ALPHA=1.0 --setenv DSGB10_CERT=1 --setenv DSGB10_DRAFT1=6 --disk-gib 128" engine/server/service.sh start
+```
+
+We run without `DSGB10_OEA` and the wide64 steps, so a reply equals the same request sent alone at any concurrency.
+That costs up to ~28 % of aggregate throughput at 16 streams
+([shared-kv-results.md §4.6](ds41f-4xgx10-switchless/docs/shared-kv-results.md)).
+
+## Results
+
+The design is [docs/shared-kv.md](ds41f-4xgx10-switchless/docs/shared-kv.md); the measurements, with their windows
+and builds, are [docs/shared-kv-results.md](ds41f-4xgx10-switchless/docs/shared-kv-results.md).
+
+- A live slot reserves 5.9 MiB instead of up to 895.4 MiB (§3.2).
+- One 17 GiB pool a box: 4,973 pages, 20,369,408 positions (§3.1).
+- The golden reference hashes: 8 of 8 with the flag on and off (§2.1).
+- The served gate: 0 of 5 concurrent replies differ from their cold alone replies; written-through copies cost
+  0.1–0.4 % of decode speed (release notes of [v0.1.0](https://github.com/GrgaPalcic/pico-dgx-ds4/releases/tag/v0.1.0)).
+
+## How it was built
+
+Coding agents wrote most of these changes, several of them running DeepSeek V4.1 Flash on this same 4-Spark
+cluster, inside test windows we designed, reviewed and gated (golden hashes, the serve tests, the share gate).
+
+Note: `#N` issue numbers in the docs refer to our internal tracker.
+
+---
+
 <p align="center">
   <img src="assets/banner.png?v=5" alt="pico-dgx-ds4: DeepSeek V4.1 Flash on 4x DGX Spark" width="100%">
 </p>

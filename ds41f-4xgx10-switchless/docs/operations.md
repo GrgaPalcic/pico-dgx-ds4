@@ -41,7 +41,7 @@ from it.
 DSGB10_PROD=1 DSGB10_ADDR="127.0.0.1 <tailnet address>" DSGB10_PORT=8888 DSGB10_KEY_FILE=~/ai/dsv41-4x-ring/state-tp4/api-key \
   DSGB10_ENGINE_ARGS="--max-ctx 262144" DSGB10_NOTE="production: dsgb10 on 127.0.0.1:8888 and <tailnet address>:8888 (M9), ~/dsgb10/prod" \
   DSGB10_BIN=~/dsgb10/prodbin/dsgb10_rank DSGB10_FRONT_BIN=~/dsgb10/prodbin/dsfront \
-  DSGB10_KEEP_GIB=4 DSGB10_YIELD_IDLE_S=120 DSGB10_HOLD_S=900 engine/server/service.sh restart
+  DSGB10_YIELD_IDLE_S=120 DSGB10_HOLD_S=900 engine/server/service.sh restart
 ```
 
 Checked at 04:13 on both addresses: models, a plain answer, thinking at `max`, a tool call, streaming, and 401

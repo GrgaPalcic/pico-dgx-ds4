@@ -15,6 +15,11 @@ The summary (per --window-min window, then the pass criteria) is printed at the 
       --minutes 60 --out DIR [--clients 3] [--seed 1] [--logs ~/dsgb10/service/logs]
   python3 engine/server/tests/soak.py --report DIR
 
+The `--shared-kv` lane is the same run against an engine started with the flag (docs/shared-kv.md §3:
+the pool's pages are the sessions' state, the slots and the store sharing one pool); the criteria are
+unchanged. A test server there runs the tests' port, e.g.
+`--url http://127.0.0.1:18890 --key-file ~/ds4-kv-share/test-key`.
+
 Pass: no errors (every response well formed: status 200, every event JSON, one finish reason, [DONE],
 usage, tool calls with known names and JSON arguments); memory flat (each rank's GPU memory and
 resident set within 256 MiB of where they started, MemAvailable within 1 GiB); latency flat (decode
@@ -55,7 +60,22 @@ import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
-BOXES = [("rank 0", None), ("rank 1", "10.0.0.4"), ("rank 2", "10.0.0.3"), ("rank 3", "10.0.0.2")]  # this fleet's workers
+
+
+def fleet_boxes():
+    """Rank 0 (here) and the workers' SSH addresses: from the fleet file in $FLEET (engine/server/fleet.sh's
+    FLEET_WORKERS), else this repo's own fleet's."""
+    workers = ["10.0.0.4", "10.0.0.3", "10.0.0.2"]
+    if os.environ.get("FLEET"):
+        out = subprocess.run(["bash", "-c", 'source "$1" && fleet_load "$FLEET" && echo "${FLEET_WORKERS[@]}"', "-",
+                              os.path.join(REPO, "engine", "server", "fleet.sh")],
+                             capture_output=True, text=True).stdout.split()
+        if len(out) == 3:
+            workers = out
+    return [("rank 0", None)] + [(f"rank {r + 1}", a) for r, a in enumerate(workers)]
+
+
+BOXES = fleet_boxes()
 CHARS_PER_TOKEN = 3.4  # code and prose in the corpus below, by the DeepSeek tokenizer (roughly)
 FE_TABLE = (256, 16 << 20)  # the front-end's session table: sessions and token ids (frontend/src/server.rs)
 GOLDEN = json.load(open(os.path.join(REPO, "golden", "long.messages.json")))
@@ -886,11 +906,14 @@ class Monitor:
 
     def sample(self):
         # the Engram row cache is an anonymous mapping of --engram-cache-mib that fills as rows are first
-        # read: its resident part is counted apart from the rest of the rank's resident set
+        # read: its resident part is counted apart from the rest of the rank's resident set. It is found by
+        # its name ([anon:engram-rows], engram/cache.h big_alloc), else by its size (an unnamed mapping can
+        # merge with its neighbours, and then is not found)
         kb = self.a.engram_cache_mib * 1024
         cmd = ("ps -o pid=,rss= -C dsgb10_rank; echo --; nvidia-smi --query-compute-apps=pid,used_memory "
                "--format=csv,noheader,nounits; echo --; awk '/^MemAvailable:/ {print $2}' /proc/meminfo; echo --; "
-               "for p in $(pgrep -x dsgb10_rank); do awk '/^Size:/ {sz=$2} /^Rss:/ {if (sz==" + str(kb) +
+               "for p in $(pgrep -x dsgb10_rank); do awk '/^[0-9a-f]+-[0-9a-f]+ / {n = /\\[anon:engram-rows\\]/} "
+               "/^Size:/ {sz=$2} /^Rss:/ {if (n || sz==" + str(kb) +
                ") c+=$2} END {print c+0}' /proc/$p/smaps; done; echo --; "
                # pinned host memory (cudaHostAlloc: shared mappings of /dev/zero), the disk tier's staging among it
                "for p in $(pgrep -x dsgb10_rank); do awk '/^[0-9a-f]+-[0-9a-f]+ / {z = ($2 ~ /s/ && /\\/dev\\/zero/)} "
@@ -977,6 +1000,9 @@ def report(out, window_min, engram_mib=4096, store_gib=11.25):
     win = lambda r: int((r["t"] - t0) // w)
     eng = [r for r in srv if r.get("src") == "engine"]
     fe = [r for r in srv if r.get("src") == "front"]
+    # what made room in the store: the server's evict/spill lines; with --shared-kv the pool makes room itself
+    # (the state's "spilled to disk" lines, no server line)
+    ev_src = "evict" if any(r.get("src") == "evict" for r in srv) else "spill"
     print(f"{len(req)} requests over {(max(r['t'] for r in req) - t0) / 60:.1f} min; by kind: "
           + ", ".join(f"{k} {n}" for k, n in collections.Counter(r["kind"] for r in req).most_common()))
     print("window | reqs  bad | decode tok/s (engine, >=32 tok, ctx<32k) | ttft s (front, <1k new) med p90 | "
@@ -991,7 +1017,7 @@ def report(out, window_min, engram_mib=4096, store_gib=11.25):
         small = [r["ttft"] for r in F if r["prompt"] - r["cached"] < 1000]
         pf = [r["prefill_tok_s"] for r in E if r["prompt"] - r["reused"] >= 4096]
         st = [r["store_mib"] for r in E]
-        ev = sum(1 for r in srv if r.get("src") == "evict" and win(r) == i)
+        ev = sum(1 for r in srv if r.get("src") == ev_src and win(r) == i)
         per = []
         for k in range(4):
             mk = [m for m in M if m["rank"] == k]
@@ -1096,7 +1122,7 @@ def report(out, window_min, engram_mib=4096, store_gib=11.25):
         print(f"front-end: RSS {fm[0]['front_mib']:.0f} -> {fm[-1]['front_mib']:.0f} MiB; {how}; a full table's ceiling "
               f"{ceiling:.0f} MiB (fit: {my - k * mx:.0f} MiB + {k * 2**20:.0f} bytes per token held): {'flat' if flat else 'NOT FLAT'}")
         ok &= flat
-    nev = sum(1 for r in srv if r.get("src") == "evict")
+    nev = sum(1 for r in srv if r.get("src") == ev_src)
     peak = max((r['store_mib'] for r in eng), default=0)
     print(f"store: {nev} evictions, at most {peak:.0f} MiB; sessions "
           f"{len({r['session'] for r in eng})}; longest prompt {max((r['prompt'] for r in eng), default=0)} tokens")

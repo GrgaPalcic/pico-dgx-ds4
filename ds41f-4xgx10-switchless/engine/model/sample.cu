@@ -54,6 +54,11 @@ __device__ __forceinline__ uint64_t mix64(uint64_t x) {
   return x;
 }
 __device__ __forceinline__ float unit(uint64_t h) { return ((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f); }
+// The Gumbel noise's uniform, strictly inside (0, 1): unit() above rounds its top value, (2^24 - 1) + 0.5, to
+// 2^24 in float, so one hash in 2^24 gave u = 1, noise -log(-log 1) = +inf, and that token won whatever its
+// logit (at 129,280 ids a position, one token in ~130 sampled without a top-k/top-p cut). 23 bits + 0.5 are
+// exact in float: u in [2^-24, 1 - 2^-24].
+__device__ __forceinline__ float unit_open(uint64_t h) { return ((float)(h >> 41) + 0.5f) * (1.0f / 8388608.0f); }
 
 __device__ __forceinline__ bool better(float a, int ia, float b, int ib) { return a > b || (a == b && ia < ib); }
 
@@ -173,7 +178,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
         z += expf((e[c] - m) * invT);
         if (!greedy) {
           const int id = vocab0 + 4 * i + c;
-          const float g = e[c] * invT - logf(-logf(unit(mix64(base + (uint64_t)id * 0xD1B54A32D192ED03ull))));
+          const float g = e[c] * invT - logf(-logf(unit_open(mix64(base + (uint64_t)id * 0xD1B54A32D192ED03ull))));
           if (g > gv) gv = g, gi = id, gl = e[c];
         }
       }

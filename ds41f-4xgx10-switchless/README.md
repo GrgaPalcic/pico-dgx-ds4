@@ -213,7 +213,10 @@ restarts what fails. `DSGB10_ENGINE_ARGS` (`--max-ctx 262144`) takes engine flag
 (`DSGB10_ENGINE_ARGS="--max-ctx 262144 --slots 4"`): up to four sessions keep their state live and decode
 together, each with its own drafts, ~240 MB a slot ([Where it stands](#where-it-stands-2026-10-13),
 [batching.md](docs/batching.md#b3-the-build-2026-10-13)); with one slot (the default, as production runs)
-requests take turns of 64 tokens. To check it (these ran against a test port):
+requests take turns of 64 tokens. `--shared-kv` ([shared-kv.md](docs/shared-kv.md)) gives the slots and the
+store one KV pool: a slot keeps only its rings, carries and the drafter's windows (5.9 MB), every slot
+holds `--max-ctx` positions, `--big-slots` is refused, and the pool's cap is `--session-gib` (12 GiB)
+plus what `--slots` would have reserved. To check it (these ran against a test port):
 
 ```bash
 (umask 077; { printf 'Authorization: Bearer '; cat ~/api-key; } > ~/api-key.header)

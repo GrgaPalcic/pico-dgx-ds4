@@ -13,9 +13,13 @@
 // host top-k of each one's keys, with the case's fill seed (its data), in DIR/bench_index_<context>_<rows>_<sessions>_
 // <kind>_seed<N>/ (.npy, meta.txt). --dump DIR (default .); --keep-all: every case's (a test of the dump);
 // --seed0 N: the fills from seed N (one case alone on another run's data: its seed and the same arguments).
-//   bench_index [--iters N] [--iqm] [--rows 1,6] [--sessions 1,4] [--table] [--dump DIR] [--seed0 N] ctx...
+// --pages: every case again with the keys in the shared pool's pages (docs/shared-kv.md §2.3): a second line
+// prints the paged times, their difference in percent from the contiguous line, and whether the paged outputs
+// are the contiguous ones bit for bit.
+//   bench_index [--iters N] [--iqm] [--pages] [--rows 1,6] [--sessions 1,4] [--table] [--dump DIR] [--seed0 N] ctx...
 #include <algorithm>
 #include <filesystem>
+#include <optional>
 #include <random>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +40,7 @@ cudaStream_t g_s;
 int g_iters = 30, g_bad = 0;
 bool g_iqm = false;  // --iqm: report the interquartile mean (the timer ticks every ~2 us)
 bool g_table = false;  // --table: a slot table for one session too
+bool g_pages = false;  // --pages: the same cases with the keys in the pool's pages (docs/shared-kv.md §2.3)
 std::string g_dump = ".";  // --dump: where a case that differs keeps its outputs
 bool g_keep_all = false;   // --keep-all: every case keeps them
 Dev<uint8_t> g_flush;
@@ -58,9 +63,54 @@ struct Out {
   std::vector<int> top, pl;
 };
 
+// --pages: a case's keys in the shared pool's pages (docs/shared-kv.md §2.3): `npg` pages a session, holding
+// 4096/ratio entries of the key and its scale at the store's page offsets, allocated in reverse address order
+// so that no two neighbours are adjacent, a zero page above each session's list, and the table row the kernels
+// read. Nothing is allocated without --pages.
+struct Pages {
+  int ratio = 0, cap = 0, ns = 0, E = 0, npg = 0, max_pages = 0;
+  size_t off[4] = {}, block = 0;
+  uint8_t* zero = nullptr;
+  Dev<uint8_t> mem;
+  Dev<uint64_t> tab;
+  Pages(int ratio_, int cap_, int ns_) : ratio(ratio_), cap(cap_), ns(ns_) {
+    if (!g_pages) return;
+    E = 4096 / ratio_;
+    npg = (cap + E - 1) / E;
+    max_pages = npg + 2;
+    block = ((size_t)(2048 * 3 + 4096) * 356 + 65535) / 65536 * 65536;
+    off[0] = 0, off[1] = E * 256, off[2] = off[1] + E * 32, off[3] = off[2] + E * 64;
+    mem = Dev<uint8_t>((size_t)ns * npg * block + block);
+    zero = mem.p + (size_t)ns * npg * block;
+    std::vector<uint64_t> h((size_t)ns * max_pages);
+    for (int s = 0; s < ns; ++s)
+      for (int i = 0; i < max_pages; ++i) h[(size_t)s * max_pages + i] = (uint64_t)(uintptr_t)(i < npg ? page(s, i) : zero);
+    tab = Dev<uint64_t>(h.data(), h.size());
+  }
+  uint8_t* page(int s, int i) const { return mem.p + ((size_t)s * npg + (npg - 1 - i)) * block; }
+  void put(int s, const uint8_t* k, const uint8_t* sc) {  // session s's keys and scales into its pages
+    for (int i = 0; i < npg; ++i) {
+      const size_t n = std::min<size_t>(E, (size_t)cap - (size_t)i * E);
+      CUDA_CHECK(cudaMemcpyAsync(page(s, i) + off[2], k + (size_t)i * E * 64, n * 64, cudaMemcpyDeviceToDevice, g_s));
+      CUDA_CHECK(cudaMemcpyAsync(page(s, i) + off[3], sc + (size_t)i * E * 4, n * 4, cudaMemcpyDeviceToDevice, g_s));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(g_s));
+  }
+  attn::IndexKeys ik(const int* slot) const {  // `slot`: the step's slot table, null for one session
+    attn::KvPages p{};
+    p.tab = tab.p;
+    p.slot = slot;
+    p.stride = (uint32_t)max_pages;
+    for (int a = 0; a < 4; ++a) p.off[a] = (uint32_t)off[a];
+    p.shift = ratio == 1 ? 12 : 11;
+    return attn::IndexKeys{nullptr, nullptr, 0, nullptr, 0, 0, p};
+  }
+};
+
 struct Case {
   int rows, ratio, ctx, max_scan, kstride, sessions, cap;
   bool pool, blk;  // blk: the Reindex layers' scan of layer 20's pool (ratio 1)
+  std::optional<Pages> pg;  // --pages: the same keys in the pool's pages (filled on first use)
   Dev<int> pos, top, pl, counters, blocks, slot;
   Dev<float2> tab;
   Dev<uint8_t> ik_k, ik_sc, q;
@@ -120,42 +170,52 @@ struct Case {
     if (blk) s.blocks = blocks.p, s.nblocks = kPool;
     return s;
   }
-  attn::IndexKeys ik() const {
+  // the keys of the sessions, contiguous or (--pages) in the pool's pages; `pages()` fills the pool from
+  // the contiguous keys the first time it is asked
+  Pages& pages() {
+    if (!pg) {
+      pg.emplace(ratio, cap, sessions);
+      for (int s = 0; s < sessions; ++s) pg->put(s, ik_k.p + (size_t)s * cap * 64, ik_sc.p + (size_t)s * cap * 4);
+    }
+    return *pg;
+  }
+  attn::IndexKeys ik(bool paged = false) {
+    const bool slots = (sessions > 1 || g_table) && rows <= attn::kMaxDecodeRows;
+    if (paged) return pages().ik(slots ? slot.p : nullptr);
     attn::IndexKeys k{ik_k.p, ik_sc.p, 0};
-    if ((sessions > 1 || g_table) && rows <= attn::kMaxDecodeRows)
-      k.slot = slot.p, k.k_stride = (size_t)cap * 64, k.sc_stride = (size_t)cap * 4;
+    if (slots) k.slot = slot.p, k.k_stride = (size_t)cap * 64, k.sc_stride = (size_t)cap * 4;
     return k;
   }
-  void fused() {
+  void fused(bool paged = false) {
     attn::IndexSel t{kTopk, top.p, tkey.p, kTopk}, ps{};
     if (pool) ps = attn::IndexSel{kPool, pl.p, pkey.p, kPool};
-    attn::index_fused(iq.p, wp.p, pos.p, tab.p, rows, ratio, ik(), scan(), max_scan, keys.p, kstride,
+    attn::index_fused(iq.p, wp.p, pos.p, tab.p, rows, ratio, ik(paged), scan(), max_scan, keys.p, kstride,
                       pool ? bkeys.p : nullptr, kstride / 8, t, ps, counters.p, false, g_s);
   }
-  void dense() {
+  void dense(bool paged = false) {
     attn::IndexSel t{kTopk, top.p, tkey.p, kTopk}, ps{};
     if (blk) {
-      attn::index_dense_blocks(iq.p, wp.p, pos.p, tab.p, rows, ratio, ik(), blocks.p, kPool, keys.p, kstride, t,
+      attn::index_dense_blocks(iq.p, wp.p, pos.p, tab.p, rows, ratio, ik(paged), blocks.p, kPool, keys.p, kstride, t,
                                scratch.p, false, g_s);
       return;
     }
     if (pool) ps = attn::IndexSel{kPool, pl.p, pkey.p, kPool};
-    attn::index_dense(iq.p, wp.p, pos.p, tab.p, rows, ratio, ik(), max_scan, keys.p, kstride, bkeys.p,
+    attn::index_dense(iq.p, wp.p, pos.p, tab.p, rows, ratio, ik(paged), max_scan, keys.p, kstride, bkeys.p,
                       kstride / 8, t, ps, scratch.p, false, g_s);
   }
   attn::IndexQ iqd() { return attn::IndexQ{q.p, qsc.p, qw.p}; }
   void q_prep() { attn::index_q_prep(iq.p, wp.p, pos.p, tab.p, iqd(), nullptr, rows, g_s); }
-  void score() {
-    attn::index_score(iqd(), pos.p, rows, ratio, ik(), scan(), max_scan, keys.p, kstride,
+  void score(bool paged = false) {
+    attn::index_score(iqd(), pos.p, rows, ratio, ik(paged), scan(), max_scan, keys.p, kstride,
                       pool ? bkeys.p : nullptr, kstride / 8, g_s);
   }
   void topk() {
     attn::index_topk(keys.p, kstride, pos.p, rows, ratio, scan(), max_scan, false, kTopk, top.p, tkey.p,
                      kTopk, g_s);
   }
-  void separate() {  // q prep, scores, selections: the path for many rows
+  void separate(bool paged = false) {  // q prep, scores, selections: the path for many rows
     q_prep();
-    score();
+    score(paged);
     topk();
     if (pool) pool_topk();
   }
@@ -256,8 +316,9 @@ void keep(const Case& c, int kind, uint32_t seed, const Out& f, const Out& d) {
   if (c.blk) npy_save(dir + "/blocks.npy", &bl[(size_t)r * kPool], kPool);
   FILE* m = std::fopen((dir + "/meta.txt").c_str(), "w");
   if (!m) die("bench_index: cannot write %s/meta.txt", dir.c_str());
-  std::fprintf(m, "--seed0 %u --rows %d --sessions %d --kinds %d%s %d\nrow %d (%s), scan keys %d; fused_*: index_fused, "
-               "dense_*: %s\n", seed, c.rows, c.sessions, kind, g_table ? " --table" : "", c.ctx, r,
+  std::fprintf(m, "--seed0 %u --rows %d --sessions %d --kinds %d%s%s %d\nrow %d (%s), scan keys %d; fused_*: index_fused, "
+               "dense_*: %s\n", seed, c.rows, c.sessions, kind, g_table ? " --table" : "",
+               g_pages ? " --pages" : "", c.ctx, r,
                row_bad(r) ? "differs" : "every row agrees", n,
                c.rows > attn::kMaxDecodeRows ? "the separate kernels" : c.blk ? "index_dense_blocks" : "index_dense");
   std::fclose(m);
@@ -336,6 +397,7 @@ int main(int argc, char** argv) {
     if (a == "--iters" && i + 1 < argc) g_iters = std::atoi(argv[++i]);
     else if (a == "--iqm") g_iqm = true;
     else if (a == "--table") g_table = true;
+    else if (a == "--pages") g_pages = true;
     else if (a == "--dump" && i + 1 < argc) g_dump = argv[++i];
     else if (a == "--keep-all") g_keep_all = true;
     else if (a == "--seed0" && i + 1 < argc) fill::g_seed = (uint32_t)std::atoll(argv[++i]);
@@ -350,9 +412,10 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
   g_flush = Dev<uint8_t>((size_t)std::max(prop.l2CacheSize, 1 << 20) * 4);
   g_sink = Dev<uint32_t>(1);
-  std::printf("%s: %d SMs, L2 %d MB; %s of %d launches, each after an L2 flush (us)%s\n", prop.name,
+  std::printf("%s: %d SMs, L2 %d MB; %s of %d launches, each after an L2 flush (us)%s%s\n", prop.name,
               prop.multiProcessorCount, prop.l2CacheSize >> 20, g_iqm ? "interquartile mean" : "median", g_iters,
-              g_table ? "; slot tables for one session too" : "");
+              g_table ? "; slot tables for one session too" : "",
+              g_pages ? "; every case again with the keys in the pool's pages" : "");
   std::printf("%8s %4s %4s %-14s %9s %9s | %8s %8s %8s %8s | %s\n", "context", "rows", "sess", "layer", "fused",
               "dense", "q prep", "scores", "top-k", "pool", "selections vs a host top-k; dense vs fused");
   for (int ctx : ctxs)
@@ -389,6 +452,35 @@ int main(int argc, char** argv) {
                       bad ? "DIFFERENT" : "same", dbad || !same ? "DIFFERENT" : "same");
           g_bad += bad + dbad + !same;
           if (bad || dbad || !same || g_keep_all) keep(c, kind, seed, fo, dout);
+          if (g_pages) {  // the same case with the keys in the pool's pages, and what it costs
+            c.fused(true);
+            const int pbad = check(c);
+            const Out pfo = c.out();
+            if (many) c.separate(true);
+            else c.dense(true);
+            const int pdbad = check(c);
+            const Out pdo = c.out();
+            const bool psame = pfo.keys == pdo.keys && (!c.pool || pfo.bkeys == pdo.bkeys) && pfo.top == pdo.top &&
+                               pfo.pl == pdo.pl;
+            const bool peq = pfo.keys == fo.keys && (!c.pool || pfo.bkeys == fo.bkeys) && pfo.top == fo.top &&
+                             pfo.pl == fo.pl && pdo.keys == dout.keys && pdo.top == dout.top && pdo.pl == dout.pl;
+            const double tpf = time_us([&] { c.fused(true); });
+            const double tpd = many ? time_us([&] { c.separate(true); }) : time_us([&] { c.dense(true); });
+            double tps = 0, tpt = 0;
+            if (S == 1 && (!g_table || many)) {
+              c.q_prep();
+              tps = time_us([&] { c.score(true); });
+              tpt = time_us([&] { c.topk(); });
+            }
+            auto pct = [](double a, double b) { return b > 0 ? 100.0 * (a - b) / b : 0.0; };
+            std::printf("%8s %4s %4s %-14s %9.1f %9.1f | %8.1f %8.1f %8.1f %8.1f | pages: %s (%+.1f%% fused, "
+                        "%+.1f%% dense, %+.1f%% scores, %+.1f%% top-k)\n",
+                        "pages", "", "", "", tpf, tpd, 0.0, tps, tpt, 0.0,
+                        peq && !pbad && !pdbad && psame ? "same" : "DIFFERENT", pct(tpf, tf), pct(tpd, td),
+                        pct(tps, ts), pct(tpt, tt));
+            g_bad += pbad + pdbad + !psame + !peq;
+            if (pbad || pdbad || !psame || !peq) keep(c, kind, seed, pfo, pdo);
+          }
         }
   return g_bad ? 1 : 0;
 }

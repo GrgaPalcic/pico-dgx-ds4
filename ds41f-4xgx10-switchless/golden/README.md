@@ -50,6 +50,15 @@ its logit and logprob, and its top 20 logprobs' ids and values.
 | sampled | `temp` | `a8f7a08f8cd1c5e8` | `--mode decode --golden G --ctx 1024 --steps 128 --big --temp 0.8 --top-p 0.95 --top-k 40 --seed 7` |
 | CED, decode at 16k | `ced16` | `81f772ab79a950e4` | `--mode decode --golden G --ctx 16384 --steps 256 --big --ced` |
 | CED, the 28.5k prompt | `ced28` | `8f08a153d415c5c8` (before 2026-10-13, printed the seed `14650fb0739d0383`) | `--mode tf --big --golden C --prompt 28489 --limit 28489 --prefill-rows 8192 --ced` |
+| the same, with `--shared-kv` | each name above | each hash above | each row's arguments and `--shared-kv` |
+
+The flag-on rows are the flag-off hashes: `--shared-kv` (one KV pool, the live slots' pages by
+reference: [shared-kv.md](../docs/shared-kv.md)) changes the memory layout, the log lines and the
+timing, never the bits. `golden/refhash.sh -- --shared-kv` runs the table with the flag (the `--`
+arguments go to every run, `refhash.sh:24-28`), and it is one of the flag's gates
+([shared-kv.md](../docs/shared-kv.md) §3): every hash is the one above, and on deepseek-ai's checkpoint
+the official values of
+[engine.md § The official checkpoint's weights](../docs/engine.md#the-official-checkpoints-weights-2026-10-13).
 
 Before 2026-10-13 (b47c510) the last run printed `14650fb0739d0383` whatever the engine computed:
 `--mode tf` hashed only teacher-forced rows, and this run has none, so it printed the hash's seed

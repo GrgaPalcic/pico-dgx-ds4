@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include "attn/pages.cuh"
+
 namespace attn {
 
 inline constexpr int kDim = 5120;      // model width
@@ -50,6 +52,17 @@ struct Compressed {      // a kv-source layer's compressed KV: entry j stands fo
   int cap;
   const int* slot = nullptr;  // session slots (above)
   size_t kv_stride = 0, sc_stride = 0;
+  // --shared-kv: the same entries in the store's pool's pages (null tab: the contiguous caches above)
+  KvPages pages;
+  // Entry e's cache: the page's (kPaged, the process's flag) or the contiguous array's.
+  template <bool kPaged>
+  __device__ const uint8_t* kv_at(int e) const { return page_ent<kPaged>(pages, kv, e, 0, 256); }
+  template <bool kPaged>
+  __device__ const uint8_t* sc_at(int e) const { return page_ent<kPaged>(pages, sc, e, 1, 32); }
+  template <bool kPaged>
+  __device__ uint8_t* kv_at_w(int e) { return page_ent_m<kPaged>(pages, kv, e, 0, 256); }
+  template <bool kPaged>
+  __device__ uint8_t* sc_at_w(int e) { return page_ent_m<kPaged>(pages, sc, e, 1, 32); }
 };
 struct IndexKeys {       // the indexer keys of the same entries
   uint8_t* k;            // [cap][64] e2m1 pairs, words transposed 4x4 (attn_common.cuh fp4x128_byte)
@@ -57,6 +70,15 @@ struct IndexKeys {       // the indexer keys of the same entries
   int cap;
   const int* slot = nullptr;  // session slots (above); the indexer's sessions are this table's
   size_t k_stride = 0, sc_stride = 0;  // whole entries apart: k_stride = 16 * sc_stride
+  KvPages pages;         // --shared-kv: the same keys in the pool's pages
+  template <bool kPaged>
+  __device__ const uint8_t* k_at(int e) const { return page_ent<kPaged>(pages, k, e, 2, 64); }
+  template <bool kPaged>
+  __device__ const uint8_t* sc_at(int e) const { return page_ent<kPaged>(pages, sc, e, 3, 4); }
+  template <bool kPaged>
+  __device__ uint8_t* k_at_w(int e) { return page_ent_m<kPaged>(pages, k, e, 2, 64); }
+  template <bool kPaged>
+  __device__ uint8_t* sc_at_w(int e) { return page_ent_m<kPaged>(pages, sc, e, 3, 4); }
 };
 
 // ---- q / kv preparation -------------------------------------------------------------------------

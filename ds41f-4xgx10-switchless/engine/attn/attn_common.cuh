@@ -147,6 +147,7 @@ __device__ __forceinline__ Compressed ckv_at(Compressed c, int r) {
     c.sc += s * c.sc_stride;
     c.slot = nullptr;
   }
+  c.pages = pages_at(c.pages, r);  // --shared-kv: row r's table (a no-op without one)
   return c;
 }
 __device__ __forceinline__ IndexKeys ik_at(IndexKeys k, int r) {
@@ -156,6 +157,7 @@ __device__ __forceinline__ IndexKeys ik_at(IndexKeys k, int r) {
     k.sc += s * k.sc_stride;
     k.slot = nullptr;
   }
+  k.pages = pages_at(k.pages, r);  // --shared-kv: row r's table (a no-op without one)
   return k;
 }
 __device__ __forceinline__ CompressorCarry carry_at(CompressorCarry c, int r) {

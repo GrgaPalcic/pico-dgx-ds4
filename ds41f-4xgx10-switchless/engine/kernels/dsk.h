@@ -171,9 +171,11 @@ void gemv_fp4w_f32(const __nv_bfloat16* x, int M, const uint8_t* W, const uint8_
 
 // ---- norm_router.cu
 // y = bf16(w * (x * rsqrt(mean(x^2) + eps))), fp32 math, rows of D (multiple of 256, <= 8192);
-// with q/s non-null also act_quant(y) into them.
+// with q/s non-null also act_quant(y) into them. blk: the CTA's threads (0: D/8). Where this norm
+// stands in for a GEMV's fused prologue it must be given that prologue's block size (32 * wn * wk,
+// the gemv_fp8.cu / gemv16.cu launches), or the sum of squares is partitioned differently.
 void rmsnorm(const __nv_bfloat16* x, const __nv_bfloat16* w, int M, int D, float eps, __nv_bfloat16* y, uint8_t* q,
-             uint8_t* s, cudaStream_t st);
+             uint8_t* s, cudaStream_t st, int blk = 0);
 // Router selection from fp32 logits [M][E] (E <= 512): scores sqrt(softplus(l)), top-6 of
 // scores + bias (descending), weights = scores / (sum + 1e-20) * route_scale.
 void router_topk(const float* logits, const float* bias, int M, int E, int* idx, float* wts, float route_scale,

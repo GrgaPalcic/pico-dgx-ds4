@@ -4,13 +4,17 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "common/check.h"
+#include "common/keepfile.h"
 
 namespace model::detail {
 
@@ -48,15 +52,13 @@ SpillFile::SpillFile(const std::string& base, size_t bytes, size_t staging, bool
   if (stat(dir.c_str(), &ds) == 0 && ds.st_uid == getuid() && (ds.st_mode & 077)) chmod(dir.c_str(), 0700);
   path_ = base + ".spill";
   size_ = bytes / kPoolGrain * kPoolGrain;
-  if (reuse) {  // the sessions a planned stop kept: the file as it is (kept_check looked at it just now)
+  if (reuse) {  // the copies a crash or a stop left: the file as it is (state_recover looked at it)
     fd_ = open(path_.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_DIRECT);
     if (fd_ < 0 && errno == EINVAL) direct_ = false, fd_ = open(path_.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
     struct stat fs;
     if (fd_ < 0 || fstat(fd_, &fs) != 0 || !S_ISREG(fs.st_mode) || fs.st_uid != getuid() || (fs.st_mode & 0777) != 0600 ||
-        (size_t)fs.st_size != size_) {
-      unlink((base + ".index").c_str());  // the next start is a clean one
+        (size_t)fs.st_size != size_)
       die("spill: cannot reuse %s, which changed since it was checked", path_.c_str());
-    }
   } else {
     unlink(path_.c_str());  // nothing persists from an earlier run
     fd_ = open(path_.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_DIRECT, 0600);
@@ -151,6 +153,28 @@ void SpillFile::flush(cudaStream_t st) {
   cv_.notify_all();
 }
 
+void SpillFile::index(std::string path, uint64_t copy, cudaStream_t st, std::function<void(std::vector<uint8_t>&)> make) {
+  if (!pending_.empty()) die("spill: an index queued before the writes it names were flushed");
+  Job j{};
+  j.seq = ++seq_;
+  j.path = std::move(path);
+  j.make = std::move(make);
+  j.copy = copy;
+  CUDA_CHECK(cudaEventCreate(&j.ev));  // its checksums and copies have landed once this is done
+  CUDA_CHECK(cudaEventRecord(j.ev, st));
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    q_.push_back(std::move(j));
+  }
+  cv_.notify_all();
+}
+
+void SpillFile::drain() {
+  if (!pending_.empty()) die("spill: a drain with writes not yet flushed");
+  std::unique_lock<std::mutex> l(mu_);
+  cv_.wait(l, [&] { return q_.empty(); });
+}
+
 void SpillFile::wait(uint64_t seq) {
   if (!pending_.empty() && seq >= pending_.front().seq) die("spill: waiting for write %llu before its flush", (unsigned long long)seq);
   std::unique_lock<std::mutex> l(mu_);
@@ -158,8 +182,7 @@ void SpillFile::wait(uint64_t seq) {
 }
 
 void SpillFile::sync() {
-  if (!pending_.empty()) die("spill: a sync with writes not yet flushed");
-  wait(seq_);
+  drain();
   if (fdatasync(fd_) != 0) die("spill: fdatasync %s: %s", path_.c_str(), std::strerror(errno));
 }
 
@@ -176,6 +199,21 @@ void SpillFile::read(void* dst, size_t bytes, size_t off, cudaStream_t st) {
 }
 
 void SpillFile::writer() {
+  // The file's I/O must not fight a decode step for a core: pin this thread to its own CPU
+  // (DSGB10_SPILL_CPU, 13: an A725 efficiency core of the GB10; a negative value: not pinned).
+  const int cpu = getenv("DSGB10_SPILL_CPU") ? std::atoi(getenv("DSGB10_SPILL_CPU")) : 13;
+  if (cpu < 0) {
+    std::printf("spill: writer not pinned\n");
+  } else {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    const int e = pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    if (e)
+      std::printf("spill: writer not pinned (CPU %d: %s)\n", cpu, std::strerror(e));
+    else
+      std::printf("spill: writer on CPU %d\n", cpu);
+  }
   cudaEvent_t waited = nullptr;
   double t_landed = 0;
   for (;;) {
@@ -185,6 +223,33 @@ void SpillFile::writer() {
       cv_.wait(l, [&] { return stop_ || !q_.empty(); });
       if (q_.empty()) return;  // stopping, and every flushed write is in the file
       j = q_.front();
+    }
+    if (!j.path.empty()) {  // an index file: its blocks are on the disk, then the index is
+      if (j.ev != waited) {
+        CUDA_CHECK(cudaEventSynchronize(j.ev));  // its checksums and its copies have landed
+        waited = j.ev;
+        t_landed = now_s();
+      }
+      if (fdatasync(fd_) != 0) die("spill: fdatasync %s: %s", path_.c_str(), std::strerror(errno));
+      if (const char* const f = getenv("DSGB10_COPY_FAULT"))
+        if ((uint64_t)std::strtoull(f, nullptr, 10) == j.copy) {
+          std::fflush(nullptr);  // test only: a crash between a copy's blocks and its index
+          _exit(9);
+        }
+      std::vector<uint8_t> bytes;
+      j.make(bytes);
+      std::string why;
+      if (!keepfile::write_atomic(j.path, bytes.data(), bytes.size(), &why))
+        die("spill: index %s: %s", j.path.c_str(), why.c_str());
+      CUDA_CHECK(cudaEventDestroy(j.ev));
+      waited = nullptr;
+      {
+        std::lock_guard<std::mutex> l(mu_);
+        q_.pop_front();
+        done_ = j.seq;
+      }
+      cv_.notify_all();
+      continue;
     }
     if (j.ev != waited) {
       CUDA_CHECK(cudaEventSynchronize(j.ev));  // the copies to staging have landed

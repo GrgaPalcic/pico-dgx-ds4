@@ -25,13 +25,15 @@ struct ServeOptions {
                                    // decoding and is prefilled; while more of them decode than there are
                                    // slots (Model::slots), they take turns of this many tokens. 0: no turns
                                    // (a request that would need the slot of another in flight waits)
-  // Kept sessions (docs/engine.md): a planned stop (SIGTERM) spills the sessions in device memory to the
-  // disk tier, the most recently used first, up to keep_bytes (0: nothing is kept), and writes every
-  // kept session's history to keep_index (beside the disk tier's files); the next start takes them back
-  // when the store reused that stop's files. Sessions unused for keep_age_s are not kept.
-  std::string keep_index;
-  size_t keep_bytes = 0;
+  // Durable copies (docs/engine.md, "The disk tier"): the server's own directory, server.<tag>.d beside
+  // the disk tier's files, holds one history file per session (<id 16 hex>.<h>.<seq>.s), written after
+  // the session's copy in the engine; the next start reads them back. A session unused for keep_age_s is
+  // not kept. Empty: nothing is written or read.
+  std::string keep_dir;
   double keep_age_s = 7 * 86400.0;
+  // Store counters (`--stats-file`): rank 0 appends one JSON line every 600 s when a counter changed,
+  // and once at a planned stop. Empty: nothing is written.
+  std::string stats_file;
   std::string name = "deepseek-v4.1-flash";
   // DSpark drafts in decode (the model bound them): Cmd's spec_drafts, spec_thresh, spec_cost, spec_gate,
   // spec_row_ms

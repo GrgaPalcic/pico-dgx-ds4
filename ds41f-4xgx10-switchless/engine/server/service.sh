@@ -35,22 +35,20 @@
 #                             long, then answers 503 with Retry-After
 #   MIN_AVAIL_GIB (100)       a box with less MemAvailable than this after the page-cache eviction fails
 #                             the engine's start (a rank needs ~90 GiB: an OOM can hang a box)
-#   DSGB10_KEEP_GIB (4)       kept sessions (docs/engine.md): an engine stop (stop, restart, a lend)
-#                             keeps the sessions for the next start: those in the disk tier, and those in
-#                             device memory, the most recently used first, up to this many GiB written at
-#                             the stop (0: nothing is kept). The engine runs with --disk-tag service, so
-#                             that its files are the service's alone
+#   DSGB10_COPY (1)          0: no finished turn is written through to the disk tier and a stop keeps
+#                             nothing (a measurement's baseline; the copies are the tier's write
+#                             traffic, docs/engine.md, "The disk tier")
 # The boxes, from the environment of every command: FLEET, the fleet file (default fleet/homelab.conf;
 # ringlock.sh): the workers (RANK<r>_SSH), the service's directory (SERVICE_DIR), each rank's files; it is
 # installed beside the frozen engine as bin/fleet.conf on every box, where the engine reads it.
 # Files: SERVICE_DIR/{bin,logs} (~/dsgb10/service here) on every box; on rank 0 also run/ (mode 700: the
 # engine's socket, dsfront's admin socket, pids, state, settings). Logs: logs/service.log (the
 # supervisor), rank.0.log and front.log on rank 0, rank.<r>.log on each worker; rotated at every (re)start
-# and, on rank 0, once over LOG_MIB (64); KEEP (5). Kept sessions, mode 600 in directories of mode 700:
-# rank<r>.service.spill and .index in the engine's spill directory on every box (the fleet's
-# RANK<r>_SPILL: /data/dsgb10/spill on rank 0, ~/dsgb10/spill on the others), server.service.index (the
-# sessions' token histories) beside rank 0's; and run/front.table, dsfront's session table (the
-# conversations' text), saved at its stop; forget removes them.
+# and, on rank 0, once over LOG_MIB (64); KEEP (5). Durable copies (docs/engine.md, "The disk tier"), mode
+# 600 in directories of mode 700: rank<r>.service.spill and rank<r>.service.d/ in the engine's spill
+# directory on every box (the fleet's RANK<r>_SPILL: /data/dsgb10/spill on rank 0, ~/dsgb10/spill on the
+# others), server.service.d/ (the sessions' token histories) beside rank 0's; and run/front.d/, dsfront's
+# session table (the conversations' text). forget removes them.
 # A test instance, from the environment of every command: DSGB10_MOCK=1 runs dsfront's mock engine in
 # place of the four ranks, on rank 0 alone, and touches no rank, worker or page cache; it needs its own
 # DSGB10_HOME (in place of SERVICE_DIR), DSGB10_PORT and RING_LOCK (tests/yield_test.sh).
@@ -92,7 +90,6 @@ settings() {
   BIN=${DSGB10_BIN:-$SRC/engine/build/server/$NAME} FBIN=${DSGB10_FRONT_BIN:-$SRC/frontend/target/release/dsfront}
   MIN_AVAIL_GIB=${MIN_AVAIL_GIB:-100}
   YIELD_IDLE_S=${DSGB10_YIELD_IDLE_S:-600} HOLD_S=${DSGB10_HOLD_S:-600}
-  KEEP_GIB=${DSGB10_KEEP_GIB:-4}
 }
 
 # the front-end's addresses, one per line; its URLs; every address's /health code; all of them 200
@@ -122,7 +119,6 @@ check() {
   [ -r "$KEY" ] || die "no API key file $KEY"
   [ $((8#$(stat -c %a "$KEY") & 8#077)) = 0 ] || die "$KEY can be read by others: chmod 600 it"
   [[ $YIELD_IDLE_S =~ ^[0-9]+$ && $HOLD_S =~ ^[0-9]+$ ]] || die "DSGB10_YIELD_IDLE_S and DSGB10_HOLD_S are seconds"
-  [[ $KEEP_GIB =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "DSGB10_KEEP_GIB '$KEEP_GIB' is not GiB"
   if [ "$MOCK" = 1 ]; then  # a test instance must share nothing with the service
     [ "$H" != "$(fleet_local "$FLEET_SERVICE_DIR")" ] || die "a mock instance needs its own DSGB10_HOME"
     [ "$LOCK" != "$FLEET_LOCK" ] || die "a mock instance needs its own RING_LOCK"
@@ -226,7 +222,7 @@ start_engine() {  # strays out, the model files' page cache dropped, memory chec
     log "not starting: MemAvailable under $MIN_AVAIL_GIB GiB on $low (another model loaded?)"
     return 1
   fi
-  ARGS="--mode serve --socket $SOCK --disk-tag service --keep-gib ${KEEP_GIB:-4} $EARGS"
+  ARGS="--mode serve --socket $SOCK --disk-tag service $EARGS"
   r=1
   for w in "${WS[@]}"; do
     old=$(for ((i = KEEP - 1; i >= 1; i--)); do echo -n "$i "; done)
@@ -246,7 +242,7 @@ start_engine() {  # strays out, the model files' page cache dropped, memory chec
   log "engine started: rank 0 pid $R0, $H/bin/$NAME $ARGS"
 }
 
-stop_engine() {  # rank 0 first: on SIGTERM a server ends the request in flight, keeps the sessions (DSGB10_KEEP_GIB) and stops ranks 1-3 (kCmdStop)
+stop_engine() {  # rank 0 first: on SIGTERM a server ends the request in flight, writes every session's state through to the disk tier and stops ranks 1-3 (kCmdStop)
   local i
   if [ -n "$R0" ] && kill -0 "$R0" 2> /dev/null; then
     kill -TERM "$R0"
@@ -268,7 +264,7 @@ stop_engine() {  # rank 0 first: on SIGTERM a server ends the request in flight,
 start_front() {
   rotate "$LOGS/front.log"
   "$H/bin/dsfront" serve $(addrs | sed "s|.*|--listen &:$PORT|") --engine-socket "$SOCK" --api-key-file "$KEY" \
-    --admin-socket "$ADMIN" --hold-s "$HOLD_S" --table-file "$RUN/front.table" $FARGS >> "$LOGS/front.log" 2>&1 < /dev/null 6>&- 8>&- 9>&- &
+    --admin-socket "$ADMIN" --hold-s "$HOLD_S" --table-dir "$RUN/front.d" $FARGS >> "$LOGS/front.log" 2>&1 < /dev/null 6>&- 8>&- 9>&- &
   FE=$! FE_T=$(date +%s)
   echo "$FE" > "$RUN/front.pid"
   log "front-end started: pid $FE, $(urls)"
@@ -513,7 +509,7 @@ cmd_start() {
     return
   fi
   mkdir -p "$RUN" "$LOGS" && chmod 700 "$RUN" || die "cannot make $RUN"
-  declare -p ADDR PORT KEY EARGS FARGS NOTE BIN FBIN MIN_AVAIL_GIB YIELD_IDLE_S HOLD_S KEEP_GIB MOCK > "$RUN/settings"
+  declare -p ADDR PORT KEY EARGS FARGS NOTE BIN FBIN MIN_AVAIL_GIB YIELD_IDLE_S HOLD_S MOCK > "$RUN/settings"
   rm -f "$RUN/state"
   setsid nohup bash "$SELF" _supervise > /dev/null 2>&1 < /dev/null &
   p=$!
@@ -608,6 +604,7 @@ cmd_forget() {
     echo "service.sh: rank 0 still runs (pid $p): service.sh stop first" >&2
     return 1
   fi
+  rm -rf "$RUN/front.d" "$RUN/front.d.tmp"
   rm -f "$RUN/front.table" "$RUN/front.table.new"
   if [ "$MOCK" = 0 ]; then
     # each box's spill directory: --disk-dir's, else the fleet's RANK<r>_SPILL ({rank}: r; its ~/ is
@@ -617,7 +614,8 @@ cmd_forget() {
       d=$(fleet_rank "${dd:-$(fleet_get "RANK${r}_SPILL")}" "$r")
       [ -n "$d" ] || continue
       f="d=$d; rm -f \$d/rank[0-3].service.spill \$d/rank[0-3].service.index \$d/rank[0-3].service.index.new"
-      f="$f \$d/server.service.index \$d/server.service.index.new; ls \$d 2> /dev/null | grep -c '[.]service[.]'"
+      f="$f; rm -rf \$d/rank[0-3].service.d \$d/server.service.d \$d/server.service.index \$d/server.service.index.new"
+      f="$f; ls \$d 2> /dev/null | grep -c '[.]service[.]'"
       if [ "$r" = 0 ]; then
         n=$(bash -c "$f")
       else

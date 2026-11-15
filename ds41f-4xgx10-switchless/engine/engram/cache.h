@@ -3,6 +3,7 @@
 // rows seen once leave before rows seen again. Shared by the store and the hit-rate simulator.
 #pragma once
 #include <sys/mman.h>
+#include <sys/prctl.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -26,11 +27,20 @@ inline uint64_t mix64(uint64_t k) {
   return k;
 }
 
-inline void* big_alloc(size_t bytes) {
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#define PR_SET_VMA_ANON_NAME 0
+#endif
+
+// An anonymous mapping named `name` in /proc/<pid>/smaps (`[anon:<name>]`, where the kernel has
+// CONFIG_ANON_VMA_NAME): a named mapping is never merged with its neighbours, so tools find it whole
+// (tests/soak.py counts the row cache's resident part apart). The name is best effort.
+inline void* big_alloc(size_t bytes, const char* name) {
   if (!bytes) return nullptr;
   void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (p == MAP_FAILED) die("engram: mmap %zu bytes: %s", bytes, strerror(errno));
   madvise(p, bytes, MADV_HUGEPAGE);
+  prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, (unsigned long)p, bytes, (unsigned long)name);
   return p;
 }
 
@@ -90,8 +100,8 @@ class ClockIndex {
   void init(size_t slots) {
     cap_ = slots;
     if (!cap_) return;
-    keys_ = static_cast<uint64_t*>(big_alloc(cap_ * 8));
-    ref_ = static_cast<uint8_t*>(big_alloc(cap_));
+    keys_ = static_cast<uint64_t*>(big_alloc(cap_ * 8, "engram-keys"));
+    ref_ = static_cast<uint8_t*>(big_alloc(cap_, "engram-refs"));
     table_.init(cap_ * 2);
     clear();
   }

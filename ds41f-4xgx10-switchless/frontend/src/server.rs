@@ -9,10 +9,11 @@ use crate::encoding::{api_tool_name, encode_messages, Delta, EncodeOptions, Enco
 use crate::engine::{EngineClient, Event as EngineEvent};
 use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
 use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
-use crate::protocol::{DoneReason, Submit, FLAG_KEEP, FLAG_SEED};
+use crate::protocol::{DoneReason, Submit, FLAG_IMAGES, FLAG_KEEP, FLAG_SEED};
 use crate::pyjson::truthy;
-use crate::session::SessionTable;
+use crate::session::{ImgKey, SessionTable};
 use crate::tokenizer::{StreamDecoder, Tokenizer};
+use crate::traffic::{Rec, Traffic};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -42,6 +43,11 @@ pub struct ServerConfig {
     pub default_top_p: f32,
     pub loop_guard: Option<LoopGuard>,
     pub tokenize_threads: usize,
+    /// The session table's limits (--table-sessions, --table-tokens): what the tier can serve.
+    pub table_sessions: usize,
+    pub table_tokens: usize,
+    /// Where each session's file goes (--table-dir; None: nothing is written or read).
+    pub table_dir: Option<std::path::PathBuf>,
     /// Write each request, its prompt and its ids here, and at its end the output's ids (debugging and
     /// bench traces; holds conversation text).
     pub dump_dir: Option<std::path::PathBuf>,
@@ -57,34 +63,37 @@ pub struct App {
     pub tok: Arc<Tokenizer>,
     pub engine: EngineClient,
     pub gate: Arc<Gate>,
+    /// --traffic-file: one JSON line per request, at its end; None: nothing is written.
+    pub traffic: Option<Traffic>,
     sessions: Mutex<SessionTable>,
     think_end_id: Option<u32>,
     counter: AtomicU64,
 }
 
 impl App {
-    pub fn new(cfg: ServerConfig, tok: Arc<Tokenizer>, engine: EngineClient) -> Arc<App> {
+    pub fn new(cfg: ServerConfig, tok: Arc<Tokenizer>, engine: EngineClient, traffic: Option<Traffic>) -> Arc<App> {
         let think_end_id = tok.token_id("</think>");
         let gate = Gate::new(cfg.hold);
-        Arc::new(App { cfg, tok, engine, gate, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0) })
+        let sessions = Mutex::new(SessionTable::new(cfg.table_sessions, cfg.table_tokens, cfg.table_dir.clone()));
+        Arc::new(App { cfg, tok, engine, gate, traffic, sessions, think_end_id, counter: AtomicU64::new(0) })
     }
 
-    /// The session table an earlier run saved (session.rs `load`), for the next turns of its
-    /// conversations: what happened, for the log.
-    pub fn load_sessions(&self, path: &std::path::Path, max_age_s: u64) -> String {
-        match self.sessions.lock().unwrap().load(path, &self.tok, max_age_s) {
-            Ok(n) => format!("session table: {n} sessions from {}", path.display()),
-            Err(e) if e.is_empty() => format!("session table: none saved at {}", path.display()),
+    /// The sessions an earlier run left in the table's directory (session.rs `load`): what happened,
+    /// for the log.
+    pub fn load_sessions(&self, max_age_s: u64) -> String {
+        let dir = self.sessions.lock().unwrap().dir();
+        match self.sessions.lock().unwrap().load(&self.tok, max_age_s) {
+            Ok(0) => format!("session table: none in {dir}"),
+            Ok(n) => format!("session table: {n} sessions from {dir}"),
             Err(e) => format!("session table: none taken ({e})"),
         }
     }
 
-    /// The session table for the next start (session.rs `save`): what happened, for the log.
-    pub fn save_sessions(&self, path: &std::path::Path, max_age_s: u64) -> String {
-        match self.sessions.lock().unwrap().save(path, max_age_s) {
-            Ok(n) => format!("session table: {n} sessions saved to {}", path.display()),
-            Err(e) => format!("session table: NOT saved: {e}"),
-        }
+    /// Every finished turn is already written (one file per session); this waits for the writer's
+    /// queue to empty: a shutdown, not a stop.
+    pub fn drain_sessions(&self) -> String {
+        self.sessions.lock().unwrap().drain();
+        "session table: every finished turn written".to_string()
     }
 
     fn random_hex(&self, n: usize) -> String {
@@ -496,6 +505,9 @@ struct Gen {
     session_id: u64,
     prompt_text: String,
     prompt_ids: Vec<u32>,
+    /// vision: the request's image spans, with their places in the prompt text and in `prompt_ids`
+    /// (empty for text); the session records them at the end
+    imgs: Vec<crate::session::ImgKey>,
     rx: mpsc::UnboundedReceiver<EngineEvent>,
     stop_ids: Vec<u32>,
     stopper: StopMatcher,
@@ -511,6 +523,8 @@ struct Gen {
     done: bool,
     t0: Instant,
     first_token: Option<Instant>,
+    /// --traffic-file: this request's record, written once at its end
+    traffic: Option<Rec>,
 }
 
 impl Gen {
@@ -520,7 +534,10 @@ impl Gen {
         loop {
             let ev = match self.rx.recv().await {
                 Some(ev) => ev,
-                None => return Some(Err("engine stream ended".into())),
+                None => {
+                    self.traffic_done("error", None);
+                    return Some(Err("engine stream ended".into()));
+                }
             };
             match ev {
                 EngineEvent::Tokens(t) => {
@@ -571,7 +588,9 @@ impl Gen {
                     if d.reason == DoneReason::Error {
                         self.app.sessions.lock().unwrap().abandon(self.session_id);
                         self.app.engine.release(self.session_id);
-                        return Some(Err(if d.error.is_empty() { "engine error".into() } else { d.error }));
+                        let e = if d.error.is_empty() { "engine error".to_string() } else { d.error.clone() };
+                        self.traffic_done("error", Some(&d));
+                        return Some(Err(e));
                     }
                     if self.stopped.is_none() {
                         self.flush(out);
@@ -592,7 +611,7 @@ impl Gen {
                         Some(te) if self.parser_was_thinking() => kept.iter().position(|&x| x == te).unwrap_or(kept.len()),
                         _ => 0,
                     };
-                    self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok);
+                    self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.imgs, &self.app.tok);
                     let usage = Usage { prompt: self.prompt_ids.len(), cached: d.cached_tokens, completion: self.kept, reasoning };
                     let total = self.t0.elapsed().as_secs_f64();
                     let ttft = self.first_token.map_or(total, |t| (t - self.t0).as_secs_f64());
@@ -615,6 +634,7 @@ impl Gen {
                         ttft,
                         if total > ttft { usage.completion as f64 / (total - ttft) } else { 0.0 }
                     );
+                    self.traffic_done(finish.as_str(), Some(&d));
                     return Some(Ok((finish, usage)));
                 }
             }
@@ -636,6 +656,24 @@ impl Gen {
     fn parser_was_thinking(&self) -> bool {
         self.prompt_text.ends_with(crate::encoding::THINK_START)
     }
+
+    /// --traffic-file: fill what the engine's Done says and write the request's line (once). A field
+    /// the path cannot know (no Done) stays null; the total time is measured at the write.
+    fn traffic_done(&mut self, finish: &'static str, d: Option<&crate::protocol::Done>) {
+        let Some(mut rec) = self.traffic.take() else { return };
+        rec.finish = Some(finish);
+        rec.completion = Some(self.kept);
+        if let Some(d) = d {
+            rec.cached = Some(d.cached_tokens);
+            rec.queue_ms = Some(d.queue_us as f64 / 1e3);
+            rec.prefill_ms = Some(d.prefill_us as f64 / 1e3);
+            rec.decode_ms = Some(d.decode_us as f64 / 1e3);
+        }
+        rec.ttft_ms = self.first_token.map(|t| (t - self.t0).as_secs_f64() * 1e3);
+        if let Some(t) = &self.app.traffic {
+            t.send(rec.line());
+        }
+    }
 }
 
 impl Drop for Gen {
@@ -644,25 +682,53 @@ impl Drop for Gen {
             // The client went away mid-request. A cancelled session keeps what it processed, of
             // which what we received is a prefix: still good for the conversation's next turn.
             self.app.engine.cancel(self.req_id);
-            self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok);
+            self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.imgs, &self.app.tok);
+            self.traffic_done("cancelled", None);
         }
     }
 }
 
-async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError> {
+/// A request's plan and SUBMIT. An image request (docs/vision.md) first goes through the encoder: its
+/// placeholders' byte offsets and each image's rows and hash make the session key, and only the ids
+/// past the cut are expanded into spans. Everything else is the text path's. `rec` is the request's
+/// --traffic-file record, filled here and moved into the Gen (which writes it at its end).
+async fn start(app: &Arc<App>, p: &Prepared, pass: Pass, rec: &mut Option<Rec>) -> Result<Gen, ApiError> {
     let unavailable = |msg: String| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), msg);
+    let bad = |msg: String| ApiError(StatusCode::BAD_REQUEST, "invalid_request_error".into(), msg);
     let Some(info) = app.engine.info() else {
         return Err(unavailable("engine not connected".into()));
     };
-    if !p.images.is_empty() {
-        return start_images(app, p, pass, info).await;
-    }
+    let enc = match p.images.is_empty() {
+        true => None,
+        false => {
+            let Some(addr) = app.cfg.vision_addr.clone() else {
+                return Err(bad("image, audio and video input are not supported".into()));
+            };
+            let e = crate::vision::encode(&addr, &p.images, Duration::from_secs(90)).await.map_err(|e| {
+                if e.starts_with("cannot read") { bad(e) } else { ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e) }
+            })?;
+            Some(e)
+        }
+    };
+    // the request's image spans: the placeholder's byte in the prompt, its rows and the encoder's hash
+    let mut imgs: Vec<ImgKey> = match &enc {
+        None => Vec::new(),
+        Some(e) => {
+            let ph = String::from_utf8_lossy(app.tok.token_bytes(crate::vision::IMAGE_TOKEN_ID)).into_owned();
+            let bytes: Vec<usize> = p.prompt.match_indices(&ph).map(|(i, _)| i).collect();
+            if bytes.len() != p.images.len() {
+                return Err(bad(format!("the prompt has {} image placeholders for {} images", bytes.len(), p.images.len())));
+            }
+            bytes.iter().zip(&e.rows).zip(&e.hashes).map(|((&byte, &rows), &hash)| ImgKey { byte, at: 0, rows, hash }).collect()
+        }
+    };
     let (plan, released) = {
         let app2 = app.clone();
         let text = p.prompt.clone();
+        let keys = imgs.clone(); // the plan reads their places, rows and hashes only
         tokio::task::spawn_blocking(move || {
             let mut t = app2.sessions.lock().unwrap();
-            t.plan(&text, &app2.tok, app2.cfg.tokenize_threads)
+            t.plan(&text, &keys, &app2.tok, app2.cfg.tokenize_threads)
         })
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
@@ -670,16 +736,40 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     for s in released {
         app.engine.release(s);
     }
-    let ctx = info.max_context as usize;
-    if plan.ids.len() >= ctx {
-        app.sessions.lock().unwrap().abandon(plan.session_id);
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error".into(),
-            format!("the prompt is {} tokens; the context window is {ctx}", plan.ids.len()),
-        ));
+    if let Some(r) = rec.as_mut() {
+        r.sess = Some(plan.session_id);
+        r.base = Some(plan.base_session_id);
     }
-    let max_new = (p.max_tokens as usize).min(ctx - plan.ids.len()) as u32;
+    // The reused ids are already expanded; the tail's placeholders become their spans, whose starts
+    // are offsets into the whole prompt.
+    let rows: Vec<u32> = enc.as_ref().map(|e| e.rows.clone()).unwrap_or_default();
+    let (tail, tail_starts) = match crate::vision::expand(&plan.ids[plan.reused..], &rows[plan.img_reused.len()..]) {
+        Ok(x) => x,
+        Err(e) => {
+            app.sessions.lock().unwrap().abandon(plan.session_id);
+            return Err(bad(e));
+        }
+    };
+    let mut ids = plan.ids[..plan.reused].to_vec();
+    ids.extend_from_slice(&tail);
+    let mut starts: Vec<u32> = plan.img_reused.clone();
+    starts.extend(tail_starts.iter().map(|&s| s + plan.reused as u32));
+    for (im, &at) in imgs.iter_mut().zip(&starts) {
+        im.at = at;
+    }
+    let ctx = info.max_context as usize;
+    if ids.len() >= ctx {
+        app.sessions.lock().unwrap().abandon(plan.session_id);
+        return Err(bad(format!(
+            "the prompt is {} tokens{}; the context window is {ctx}",
+            ids.len(),
+            if enc.is_some() { " with its images" } else { "" }
+        )));
+    }
+    let max_new = (p.max_tokens as usize).min(ctx - ids.len()) as u32;
+    if let Some(r) = rec.as_mut() {
+        r.prompt = Some(ids.len());
+    }
     let mut stop_ids = p.stop_ids.clone();
     if !p.ignore_eos {
         stop_ids.push(info.eos_id);
@@ -693,12 +783,12 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         top_p: p.top_p,
         top_k: p.top_k,
         max_new_tokens: max_new,
-        flags: FLAG_KEEP | if p.seed.is_some() { FLAG_SEED } else { 0 },
+        flags: FLAG_KEEP | if p.seed.is_some() { FLAG_SEED } else { 0 } | if enc.is_some() { FLAG_IMAGES } else { 0 },
         n_top_logprobs: 0,
         prefix_hint: plan.reused as u32,
         stop_ids: stop_ids.clone(),
-        prompt: plan.ids.clone(),
-        images: None,
+        prompt: ids.clone(),
+        images: enc.as_ref().map(|e| crate::vision::payload(&starts, e)),
     };
     let (req_id, rx) = match app.engine.submit(submit) {
         Ok(x) => x,
@@ -709,88 +799,18 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     };
     // where it starts (counts only); rank 0's "serve: req N restart:" line says what the engine found
     eprintln!("req {req_id} plan: {}", plan.describe(p.prompt.len()));
+    if let Some(e) = &enc {
+        // counts only: the images, their rows and the encoder's time
+        eprintln!("req {req_id} images: {} ({} rows), encoder {:.0} ms", e.rows.len(), e.rows.iter().sum::<u32>(), e.ms);
+    }
     Ok(Gen {
         app: app.clone(),
         _pass: pass,
         req_id,
         session_id: plan.session_id,
         prompt_text: p.prompt.clone(),
-        prompt_ids: plan.ids,
-        rx,
-        stop_ids,
-        stopper: StopMatcher::new(p.stops.clone()),
-        parser: StreamParser::with_tools(p.mode, p.tools),
-        dec: StreamDecoder::default(),
-        ids: Vec::new(),
-        kept: 0,
-        gen_bytes: Vec::new(),
-        gen_ends: Vec::new(),
-        stopped: None,
-        done: false,
-        t0: Instant::now(),
-        first_token: None,
-    })
-}
-
-/// A request with images (docs/vision.md): its images through the encoder, the placeholders expanded into
-/// their spans, and a session of its own that the engine frees at the end (no KEEP) and the text table
-/// never sees, so text requests' prefix reuse is untouched.
-async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::protocol::HelloEngine) -> Result<Gen, ApiError> {
-    let bad = |msg: String| ApiError(StatusCode::BAD_REQUEST, "invalid_request_error".into(), msg);
-    let Some(addr) = app.cfg.vision_addr.clone() else {
-        return Err(bad("image, audio and video input are not supported".into()));
-    };
-    let enc = crate::vision::encode(&addr, &p.images, Duration::from_secs(90)).await.map_err(|e| {
-        if e.starts_with("cannot read") { bad(e) } else { ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e) }
-    })?;
-    let ids = {
-        let (app2, text) = (app.clone(), p.prompt.clone());
-        tokio::task::spawn_blocking(move || app2.tok.encode_parallel(&text, app2.cfg.tokenize_threads))
-            .await
-            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
-    };
-    let (ids, starts) = crate::vision::expand(&ids, &enc.rows).map_err(bad)?;
-    let ctx = info.max_context as usize;
-    if ids.len() >= ctx {
-        return Err(bad(format!("the prompt is {} tokens with its images; the context window is {ctx}", ids.len())));
-    }
-    let max_new = (p.max_tokens as usize).min(ctx - ids.len()) as u32;
-    let mut stop_ids = p.stop_ids.clone();
-    if !p.ignore_eos {
-        stop_ids.push(info.eos_id);
-    }
-    let session_id = (1u64 << 63) | u64::from_str_radix(&app.random_hex(15), 16).unwrap_or(1);
-    let submit = Submit {
-        req_id: 0,
-        session_id,
-        base_session_id: 0,
-        seed: p.seed.unwrap_or(0),
-        temperature: p.temperature,
-        top_p: p.top_p,
-        top_k: p.top_k,
-        max_new_tokens: max_new,
-        flags: crate::protocol::FLAG_IMAGES | if p.seed.is_some() { FLAG_SEED } else { 0 },
-        n_top_logprobs: 0,
-        prefix_hint: 0,
-        stop_ids: stop_ids.clone(),
-        prompt: ids.clone(),
-        images: Some(crate::vision::payload(&starts, &enc)),
-    };
-    let (req_id, rx) = app.engine.submit(submit).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e))?;
-    eprintln!(
-        "req {req_id} images: {} ({} rows), encoder {:.0} ms; prompt {} ids; session {session_id} (not kept)",
-        enc.rows.len(),
-        enc.rows.iter().sum::<u32>(),
-        enc.ms,
-        ids.len()
-    );
-    Ok(Gen {
-        app: app.clone(),
-        _pass: pass,
-        req_id,
-        session_id,
-        prompt_text: p.prompt.clone(),
         prompt_ids: ids,
+        imgs,
         rx,
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),
@@ -804,10 +824,23 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         done: false,
         t0: Instant::now(),
         first_token: None,
+        traffic: rec.take(),
     })
 }
 
 async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
+    let mut rec = app.traffic.as_ref().map(|_| Rec::new());
+    let r = chat_inner(app.clone(), headers, body, &mut rec).await;
+    // a record still here is a request that ended before its engine stream (a stream's task writes
+    // its own): its end is here
+    if let (Some(t), Some(mut rec)) = (&app.traffic, rec) {
+        rec.finish.get_or_insert("error");
+        t.send(rec.line());
+    }
+    r
+}
+
+async fn chat_inner(app: Arc<App>, headers: HeaderMap, body: Bytes, rec: &mut Option<Rec>) -> Response {
     if let Err(r) = check_auth(&app, &headers) {
         return r;
     }
@@ -819,12 +852,18 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
         Ok(p) => p,
         Err(e) => return bad_request(e),
     };
+    if let Some(r) = rec.as_mut() {
+        r.stream = Some(p.stream);
+        r.thinking = Some(p.mode == ThinkingMode::Thinking);
+        r.images = Some(p.images.len());
+        r.tools = Some(p.tools);
+    }
     // While the engine is down (the ring lent to a job, or a restart) a request waits at the gate. A
     // stream that has to wait starts at once and carries comments meanwhile, so that its client's
     // timeout sees bytes; refused, it ends with an error event. Anything else waits here, refused with
     // 503 and Retry-After.
     if p.stream && !app.gate.open(app.engine.info().is_some()) {
-        return stream(app, p, req, None);
+        return stream(app.clone(), p, req, None, rec.take());
     }
     let pass = match app.gate.enter(&app.engine).await {
         Ok(pass) => pass,
@@ -835,9 +874,9 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
         }
     };
     if p.stream {
-        return stream(app, p, req, Some(pass));
+        return stream(app.clone(), p, req, Some(pass), rec.take());
     }
-    let mut gen = match start(&app, &p, pass).await {
+    let mut gen = match start(&app, &p, pass, rec).await {
         Ok(g) => g,
         Err(e) => return e.response(),
     };
@@ -890,86 +929,98 @@ fn dump(app: &App, req: &Value, p: &Prepared, gen: &Gen) {
 /// A streamed answer. Without a pass it waits at the gate first: the stream starts at once with a
 /// comment saying why, and a refusal (the hold limit, a shutdown) is its error event. Any stream gets
 /// a comment after KEEP_ALIVE without an event (waiting at the gate, or for a long prefill).
-fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Response {
+fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>, rec: Option<Rec>) -> Response {
     let (tx, rx) = mpsc::channel::<Event>(256);
     tokio::spawn(async move {
-        let last = |e: ApiError| {
-            let tx = tx.clone();
-            async move {
-                let _ = tx.send(Event::default().data(e.json().to_string())).await;
-                let _ = tx.send(Event::default().data("[DONE]")).await;
-            }
-        };
-        let pass = match pass {
-            Some(pass) => pass,
-            None => {
-                let why = if app.gate.held() { "the ring is lent to a development job" } else { "the engine is not connected" };
-                let note = format!("waiting for the engine ({why}), up to {} s", app.gate.hold_limit().as_secs());
-                if tx.send(Event::default().comment(note)).await.is_err() {
-                    return;
-                }
-                tokio::select! {
-                    r = app.gate.enter(&app.engine) => match r {
-                        Ok(pass) => pass,
-                        Err(r) => return last(refused(r)).await,
-                    },
-                    _ = tx.closed() => return, // the client went away: counted out at the gate
-                }
-            }
-        };
-        let mut gen = match start(&app, &p, pass).await {
-            Ok(g) => g,
-            Err(e) => return last(e).await,
-        };
-        dump(&app, &req, &p, &gen);
-        let id = format!("chatcmpl-{}", app.random_hex(24));
-        let created = now_secs();
-        let model = app.cfg.model_name.clone();
-        let chunk = |delta: Value, finish: Option<&str>| {
-            json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                   "choices": [{"index": 0, "delta": delta, "logprobs": null, "finish_reason": finish}]})
-        };
-        let send = |v: Value| tx.send(Event::default().data(v.to_string()));
-        if send(chunk(json!({"role": "assistant", "content": ""}), None)).await.is_err() {
-            return;
+        let mut rec = rec;
+        stream_task(&app, p, req, pass, &mut rec, tx).await;
+        // the record is still here when the request ended before its engine stream (its Gen writes it)
+        if let (Some(t), Some(mut rec)) = (&app.traffic, rec) {
+            rec.finish.get_or_insert("error");
+            t.send(rec.line());
         }
-        let mut out = Vec::new();
-        loop {
-            let end = gen.next(&mut out).await;
-            for d in out.drain(..) {
-                let delta = match d {
-                    Delta::Reasoning(s) => json!({"reasoning_content": s}),
-                    Delta::Content(s) => json!({"content": s}),
-                    Delta::ToolCall(i, name, args) => {
-                        json!({"tool_calls": [tool_call_json(app.cfg.encoding, Some(i), app.random_hex(24), &name, args)]})
-                    }
-                };
-                if send(chunk(delta, None)).await.is_err() {
-                    return; // client gone; dropping gen cancels the request
-                }
-            }
-            match end {
-                None => continue,
-                Some(Ok((finish, usage))) => {
-                    let _ = send(chunk(json!({}), Some(finish.as_str()))).await;
-                    if p.include_usage {
-                        let _ = send(json!({"id": id, "object": "chat.completion.chunk", "created": created,
-                                            "model": model, "choices": [], "usage": usage.json()}))
-                        .await;
-                    }
-                    break;
-                }
-                Some(Err(e)) => {
-                    let _ = send(json!({"error": {"message": e, "type": "server_error", "param": null, "code": 500}})).await;
-                    break;
-                }
-            }
-        }
-        let _ = tx.send(Event::default().data("[DONE]")).await;
     });
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let stream = futures_util::StreamExt::map(stream, Ok::<_, Infallible>);
     Sse::new(stream).keep_alive(KeepAlive::new().interval(KEEP_ALIVE)).into_response()
+}
+
+/// A streamed request's task: the gate, the engine, and the SSE events. It ends when the answer ends
+/// (its Gen writes the --traffic-file line) or when the client goes away (dropping its Gen).
+async fn stream_task(app: &Arc<App>, p: Prepared, req: Value, pass: Option<Pass>, rec: &mut Option<Rec>, tx: mpsc::Sender<Event>) {
+    let last = |e: ApiError| {
+        let tx = tx.clone();
+        async move {
+            let _ = tx.send(Event::default().data(e.json().to_string())).await;
+            let _ = tx.send(Event::default().data("[DONE]")).await;
+        }
+    };
+    let pass = match pass {
+        Some(pass) => pass,
+        None => {
+            let why = if app.gate.held() { "the ring is lent to a development job" } else { "the engine is not connected" };
+            let note = format!("waiting for the engine ({why}), up to {} s", app.gate.hold_limit().as_secs());
+            if tx.send(Event::default().comment(note)).await.is_err() {
+                return;
+            }
+            tokio::select! {
+                r = app.gate.enter(&app.engine) => match r {
+                    Ok(pass) => pass,
+                    Err(r) => return last(refused(r)).await,
+                },
+                _ = tx.closed() => return, // the client went away: counted out at the gate
+            }
+        }
+    };
+    let mut gen = match start(app, &p, pass, rec).await {
+        Ok(g) => g,
+        Err(e) => return last(e).await,
+    };
+    dump(app, &req, &p, &gen);
+    let id = format!("chatcmpl-{}", app.random_hex(24));
+    let created = now_secs();
+    let model = app.cfg.model_name.clone();
+    let chunk = |delta: Value, finish: Option<&str>| {
+        json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+               "choices": [{"index": 0, "delta": delta, "logprobs": null, "finish_reason": finish}]})
+    };
+    let send = |v: Value| tx.send(Event::default().data(v.to_string()));
+    if send(chunk(json!({"role": "assistant", "content": ""}), None)).await.is_err() {
+        return;
+    }
+    let mut out = Vec::new();
+    loop {
+        let end = gen.next(&mut out).await;
+        for d in out.drain(..) {
+            let delta = match d {
+                Delta::Reasoning(s) => json!({"reasoning_content": s}),
+                Delta::Content(s) => json!({"content": s}),
+                Delta::ToolCall(i, name, args) => {
+                    json!({"tool_calls": [tool_call_json(app.cfg.encoding, Some(i), app.random_hex(24), &name, args)]})
+                }
+            };
+            if send(chunk(delta, None)).await.is_err() {
+                return; // client gone; dropping gen cancels the request
+            }
+        }
+        match end {
+            None => continue,
+            Some(Ok((finish, usage))) => {
+                let _ = send(chunk(json!({}), Some(finish.as_str()))).await;
+                if p.include_usage {
+                    let _ = send(json!({"id": id, "object": "chat.completion.chunk", "created": created,
+                                        "model": model, "choices": [], "usage": usage.json()}))
+                    .await;
+                }
+                break;
+            }
+            Some(Err(e)) => {
+                let _ = send(json!({"error": {"message": e, "type": "server_error", "param": null, "code": 500}})).await;
+                break;
+            }
+        }
+    }
+    let _ = tx.send(Event::default().data("[DONE]")).await;
 }
 
 #[cfg(test)]
@@ -988,6 +1039,9 @@ mod tests {
             default_top_p: 0.95,
             loop_guard: None,
             tokenize_threads: 1,
+            table_sessions: 256,
+            table_tokens: 16 << 20,
+            table_dir: None,
             dump_dir: None,
             hold: Duration::from_secs(600),
             vision_addr: None,

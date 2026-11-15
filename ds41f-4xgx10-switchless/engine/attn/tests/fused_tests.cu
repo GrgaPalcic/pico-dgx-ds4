@@ -12,7 +12,14 @@
 // checked against calls of at most 8 rows (compressor_project_rows; index_dense and index_dense_blocks: each
 // row's selections). decode_prep and the chained layers stay at 8 rows here: past 8 rows a step has several
 // sessions (attn.h), which slot_tests checks. Prints one line per group; exits non-zero on any difference.
-//   fused_tests
+// --pages runs the groups that touch a compressed cache (decode_prep, the indexer's scans, sparse_attn, the
+// chained layers) with those caches in the shared pool's pages (page_pool.cuh): one pool whose pages hold all
+// four kv sources at the engine's offsets (page_off), a case's own state in its source (0 ratio 2, 3 ratio 1)
+// and a second, distinct ratio-2 state in source 1, so two sources share the pages. Every output is compared
+// with the contiguous run's. --pages-badlayout is the same with the views built from layout_of(ratio), the
+// engine's bug before commit 5f0d039 (a ratio-2 source other than the first lands in the first one's block): a
+// negative control, every paged check must differ.
+//   fused_tests [--pages | --pages-badlayout]
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -23,6 +30,7 @@
 #include "attn/attn.h"
 #include "fill.cuh"
 #include "kernels/dsk.h"
+#include "page_pool.cuh"
 #include "testutil.h"
 
 using namespace attn_test;
@@ -36,6 +44,9 @@ cudaStream_t g_s;
 int g_checks = 0, g_fail = 0;
 std::string g_group;
 int g_group_checks = 0, g_group_fail = 0;
+bool g_pages = false;  // --pages: the same groups with the caches in the pool's pages (docs/shared-kv.md §2.3)
+bool g_bad = false;    // --pages-badlayout: the same with layout_of's views, the negative control (must differ)
+bool g_paged = false;  // the page modes together, set from the arguments
 
 void begin(const std::string& name) {
   g_group = name;
@@ -259,6 +270,29 @@ struct Ring {
   attn::Window win() const { return attn::Window{kv.p, sc.p}; }
 };
 
+// --pages: a case's caches in the shared pool's pages (docs/shared-kv.md §2.3, page_pool.cuh). One pool holds
+// all four kv sources at the engine's offsets; a case's state lives in source `src` (0 for a ratio-2 case, 3 for
+// a ratio-1 one) and a second ratio-2 state in source 1, so two sources share the pages. `put`/`get` copy a
+// contiguous array of the source's entries to/from its pages. Nothing is allocated without --pages.
+struct Pages {
+  PagePool pool;
+  int src = 0;
+  Pages(int cap2, int cap1, int src_) : pool(g_paged ? cap2 : 0, cap1, 1, g_bad), src(src_) {}
+  attn::Compressed ckv() const { return pool.ckv(src, 0, pool.cap[src]); }
+  attn::IndexKeys ik() const { return pool.ik(src, 0, pool.cap[src]); }
+  attn::Compressed ckv(int k) const { return pool.ckv(k, 0, pool.cap[k]); }
+  attn::IndexKeys ik(int k) const { return pool.ik(k, 0, pool.cap[k]); }
+  void put(int a, const uint8_t* src_) const { pool.put(src, a, 0, src_, g_s); }
+  void put(int k, int a, const uint8_t* src_) const { pool.put(k, a, 0, src_, g_s); }
+  void get(int a, uint8_t* dst) const {
+    pool.get(src, a, 0, dst, g_s);
+    CUDA_CHECK(cudaStreamSynchronize(g_s));
+  }
+  void get(int k, int a, uint8_t* dst) const {
+    pool.get(k, a, 0, dst, g_s);
+    CUDA_CHECK(cudaStreamSynchronize(g_s));
+  }
+};
 // ---- DSpark's uses: a rank's fn slice, the lagged pre-mix, hc_pre as a PDL launch, kv_write_sets ----------
 
 void test_dspark(int rows) {
@@ -362,9 +396,16 @@ void test_prep(int rows, int ratio, bool index, int last) {
   fill::f32(score, 1.f);
   Ring ring_u;
   CompState cu = ratio ? CompState(ratio, maxpos) : CompState();
+  CompState cu2 = ratio ? CompState(2, maxpos) : CompState();  // the pool's second ratio-2 source (source 1)
   sync();
   Ring ring_f(ring_u);
-  CompState cf = cu.copy();
+  CompState cf = cu.copy(), cf2 = cu2.copy();
+  const int src = ratio == 1 ? 3 : 0;
+  Pages pg(ratio ? cu2.cap : 0, ratio ? cu.cap : 0, src);  // unused for a window-only layer (ratio 0)
+  if (g_paged && ratio) {
+    pg.put(0, cf.ckv_kv.p), pg.put(1, cf.ckv_sc.p), pg.put(2, cf.ik_k.p), pg.put(3, cf.ik_sc.p);
+    pg.put(1, 0, cf2.ckv_kv.p), pg.put(1, 1, cf2.ckv_sc.p), pg.put(1, 2, cf2.ik_k.p), pg.put(1, 3, cf2.ik_sc.p);
+  }
   // separate
   Dev<uint16_t> qr((size_t)rows * attn::kQLora);
   Dev<uint8_t> qq((size_t)rows * attn::kQLora), qs((size_t)rows * attn::kQLora / 32);
@@ -375,6 +416,9 @@ void test_prep(int rows, int ratio, bool index, int last) {
   if (ratio)
     attn::compressor_emit(proj.p, score.p, pos.p, rows, cu.cw(nullptr, nullptr), cu.carry(), tab.p, cu.ckv(), cu.ik(),
                           nullptr, 0, g_s);
+  if (ratio && g_paged)  // source 1's reference: the same emit on its own contiguous state
+    attn::compressor_emit(proj.p, score.p, pos.p, rows, cu2.cw(nullptr, nullptr), cu2.carry(), tab.p, cu2.ckv(),
+                          cu2.ik(), nullptr, 0, g_s);
   if (index) attn::gemv_bf16(x.p, rows, kDim, wproj.p, nullptr, 32, 32, wp.p, nullptr, true, g_s);
   // fused
   Dev<uint16_t> qr2((size_t)rows * attn::kQLora);
@@ -396,8 +440,8 @@ void test_prep(int rows, int ratio, bool index, int last) {
     a.cscore = score.p;
     a.cw = cf.cw(nullptr, nullptr);
     a.carry = cf.carry();
-    a.ckv = cf.ckv();
-    a.ik = cf.ik();
+    a.ckv = g_paged ? pg.ckv() : cf.ckv();
+    a.ik = g_paged ? pg.ik() : cf.ik();
   }
   if (index) {
     a.x = x.p;
@@ -410,7 +454,33 @@ void test_prep(int rows, int ratio, bool index, int last) {
   same("q scales", qs, qs2);
   same("ring", ring_u.kv, ring_f.kv);
   same("ring scales", ring_u.sc, ring_f.sc);
-  if (ratio) cu.check(cf, "compressor");
+  if (ratio && g_paged) {  // the fused side's caches are in the pool's pages
+    Dev<uint8_t> gkv(cu.ckv_kv.n), gsc(cu.ckv_sc.n), gik(cu.ik_k.n), giks(cu.ik_sc.n);
+    pg.get(0, gkv.p), pg.get(1, gsc.p), pg.get(2, gik.p), pg.get(3, giks.p);
+    same("compressor ckv (pages)", cu.ckv_kv, gkv);
+    same("compressor ckv scales (pages)", cu.ckv_sc, gsc);
+    same("compressor index keys (pages)", cu.ik_k, gik);
+    same("compressor index key scales (pages)", cu.ik_sc, giks);
+    same("compressor carry kv (pages)", cu.carry_kv, cf.carry_kv);
+    same("compressor carry score (pages)", cu.carry_sc, cf.carry_sc);
+    // source 1 (ratio 2): a distinct state in the same pages, the same decode_prep
+    attn::DecodePrep a2 = a;
+    a2.cw = cf2.cw(nullptr, nullptr);
+    a2.carry = cf2.carry();
+    a2.ckv = pg.ckv(1);
+    a2.ik = pg.ik(1);
+    attn::decode_prep(a2, rows, true, g_s);
+    Dev<uint8_t> gkv2(cu2.ckv_kv.n), gsc2(cu2.ckv_sc.n), gik2(cu2.ik_k.n), giks2(cu2.ik_sc.n);
+    pg.get(1, 0, gkv2.p), pg.get(1, 1, gsc2.p), pg.get(1, 2, gik2.p), pg.get(1, 3, giks2.p);
+    same("compressor ckv (pages source 1)", cu2.ckv_kv, gkv2);
+    same("compressor ckv scales (pages source 1)", cu2.ckv_sc, gsc2);
+    same("compressor index keys (pages source 1)", cu2.ik_k, gik2);
+    same("compressor index key scales (pages source 1)", cu2.ik_sc, giks2);
+    same("compressor carry kv (pages source 1)", cu2.carry_kv, cf2.carry_kv);
+    same("compressor carry score (pages source 1)", cu2.carry_sc, cf2.carry_sc);
+  } else if (ratio) {
+    cu.check(cf, "compressor");
+  }
   if (index) same("head weights", wp, wp2);
   end();
 }
@@ -431,7 +501,7 @@ struct IdxBufs {  // one path's scan keys and selections
 
 // the scan of a dense part (or a block list) for ratio-`ratio` keys of a context of `ctx` positions
 struct IdxCase {
-  int rows, ratio, ctx, max_scan;
+  int rows, ratio, ctx, cap, max_scan;
   attn::IndexScan scan;
   Dev<int> pos, blocks;
   Dev<float2> tab;
@@ -441,7 +511,7 @@ struct IdxCase {
   IdxCase(int rows_, int ratio_, int ctx_, int part, bool use_blocks) : rows(rows_), ratio(ratio_), ctx(ctx_) {
     pos = positions(rows, ctx - 1);
     tab = table(ctx + 1, true);
-    int cap = ctx / ratio + 64;
+    cap = ctx / ratio + 64;
     ik_k = Dev<uint8_t>((size_t)cap * 64);
     ik_sc = Dev<uint8_t>((size_t)cap * 4);
     iq = Dev<uint16_t>((size_t)rows * attn::kIdxHeads * attn::kIdxDim);
@@ -480,13 +550,16 @@ struct IdxCase {
 };
 
 // separate: q prep, scores, top-k (+ pool) into slot `slot` of the outputs (stride top_stride / pool_stride)
-void index_separate(const IdxCase& c, IdxBufs& b, bool pool, int slot, int top_stride, int pool_stride) {
+// pik: the keys through the pool's pages instead of c.ik() (--pages)
+void index_separate(const IdxCase& c, IdxBufs& b, bool pool, int slot, int top_stride, int pool_stride,
+                    const attn::IndexKeys* pik = nullptr) {
+  const attn::IndexKeys ik = pik ? *pik : c.ik();
   Dev<uint8_t> q((size_t)c.rows * attn::kIdxHeads * 64);
   Dev<uint32_t> qsc(c.rows * attn::kIdxHeads);
   Dev<float> qw(c.rows * attn::kIdxHeads);
   attn::IndexQ iq{q.p, qsc.p, qw.p};
   attn::index_q_prep(c.iq.p, c.wp.p, c.pos.p, c.tab.p, iq, nullptr, c.rows, g_s);
-  attn::index_score(iq, c.pos.p, c.rows, c.ratio, c.ik(), c.scan, c.max_scan, b.keys.p, b.kstride,
+  attn::index_score(iq, c.pos.p, c.rows, c.ratio, ik, c.scan, c.max_scan, b.keys.p, b.kstride,
                     pool ? b.bkeys.p : nullptr, b.kstride / 8, g_s);
   attn::index_topk(b.keys.p, b.kstride, c.pos.p, c.rows, c.ratio, c.scan, c.max_scan, false, kTopk,
                    b.top.p + slot * kTopk, b.tkey.p + slot * kTopk, top_stride, g_s);
@@ -495,10 +568,12 @@ void index_separate(const IdxCase& c, IdxBufs& b, bool pool, int slot, int top_s
                      b.pool.p + slot * kPool, b.pkey.p + slot * kPool, pool_stride, g_s);
   CUDA_CHECK(cudaStreamSynchronize(g_s));
 }
-void index_fused(const IdxCase& c, IdxBufs& b, bool pool, int slot, int top_stride, int pool_stride, int* counters) {
+void index_fused(const IdxCase& c, IdxBufs& b, bool pool, int slot, int top_stride, int pool_stride, int* counters,
+                 const attn::IndexKeys* pik = nullptr) {
+  const attn::IndexKeys ik = pik ? *pik : c.ik();
   attn::IndexSel top{kTopk, b.top.p + slot * kTopk, b.tkey.p + slot * kTopk, top_stride}, ps{};
   if (pool) ps = attn::IndexSel{kPool, b.pool.p + slot * kPool, b.pkey.p + slot * kPool, pool_stride};
-  attn::index_fused(c.iq.p, c.wp.p, c.pos.p, c.tab.p, c.rows, c.ratio, c.ik(), c.scan, c.max_scan, b.keys.p,
+  attn::index_fused(c.iq.p, c.wp.p, c.pos.p, c.tab.p, c.rows, c.ratio, ik, c.scan, c.max_scan, b.keys.p,
                     b.kstride, pool ? b.bkeys.p : nullptr, b.kstride / 8, top, ps, counters, true, g_s);
 }
 
@@ -520,6 +595,42 @@ void test_index(int rows, int ratio, int ctx, int part, bool pool, bool blocks) 
     same("pool keys", u.pkey, f.pkey);
   }
   same("counters left zero", counters, Dev<int>(attn::kMaxDecodeRows));
+  if (g_paged) {  // the same scan with the keys in the pool's pages: the case's source and source 1
+    IdxCase c2(rows, 2, ctx, part, blocks);  // source 1's distinct state
+    const int src = ratio == 1 ? 3 : 0;
+    Pages pg(c2.cap, ratio == 1 ? c.cap : c2.cap, src);
+    pg.put(2, c.ik_k.p), pg.put(3, c.ik_sc.p);
+    pg.put(1, 2, c2.ik_k.p), pg.put(1, 3, c2.ik_sc.p);
+    const attn::IndexKeys pik = pg.ik();
+    IdxBufs fp(rows, c.kstride(), kTopk, kPool);
+    index_fused(c, fp, pool, 0, kTopk, kPool, counters.p, &pik);
+    same("keys (pages)", f.keys, fp.keys);
+    same("top (pages)", f.top, fp.top);
+    same("top keys (pages)", f.tkey, fp.tkey);
+    if (pool) {
+      same("block maxima (pages)", f.bkeys, fp.bkeys);
+      same("pool (pages)", f.pool, fp.pool);
+      same("pool keys (pages)", f.pkey, fp.pkey);
+    }
+    same("counters left zero (pages)", counters, Dev<int>(attn::kMaxDecodeRows));
+    IdxBufs sp(rows, c.kstride(), kTopk, kPool);
+    index_separate(c, sp, pool, 0, kTopk, kPool, &pik);
+    same("keys (pages, separate)", u.keys, sp.keys);
+    same("top (pages, separate)", u.top, sp.top);
+    same("top keys (pages, separate)", u.tkey, sp.tkey);
+    const attn::IndexKeys pik2 = pg.ik(1);
+    IdxBufs r2(rows, c2.kstride(), kTopk, kPool), fp2(rows, c2.kstride(), kTopk, kPool);
+    index_fused(c2, r2, pool, 0, kTopk, kPool, counters.p);  // source 1's reference
+    index_fused(c2, fp2, pool, 0, kTopk, kPool, counters.p, &pik2);
+    same("keys (pages source 1)", r2.keys, fp2.keys);
+    same("top (pages source 1)", r2.top, fp2.top);
+    same("top keys (pages source 1)", r2.tkey, fp2.tkey);
+    if (pool) {
+      same("block maxima (pages source 1)", r2.bkeys, fp2.bkeys);
+      same("pool (pages source 1)", r2.pool, fp2.pool);
+      same("pool keys (pages source 1)", r2.pkey, fp2.pkey);
+    }
+  }
   end();
 }
 
@@ -565,6 +676,39 @@ void test_dense(int rows, int ratio, int ctx, bool pool, int cand) {
     }
   }
   same("scratch left zero", scratch, Dev<uint32_t>(scratch.n));
+  if (g_paged) {  // the same scan with the keys in the pool's pages: the case's source and source 1
+    IdxCase c2(rows, 2, ctx, -1, false);  // source 1's distinct state
+    const int src = ratio == 1 ? 3 : 0;
+    Pages pg(c2.cap, ratio == 1 ? c.cap : c2.cap, src);
+    pg.put(2, c.ik_k.p), pg.put(3, c.ik_sc.p);
+    pg.put(1, 2, c2.ik_k.p), pg.put(1, 3, c2.ik_sc.p);
+    IdxBufs fp(rows, c.kstride(), kTopk, kPool);
+    attn::IndexSel top{kTopk, fp.top.p, fp.tkey.p, kTopk}, ps{};
+    if (pool) ps = attn::IndexSel{kPool, fp.pool.p, fp.pkey.p, kPool};
+    attn::index_dense(c.iq.p, c.wp.p, c.pos.p, c.tab.p, rows, ratio, pg.ik(), c.max_scan, fp.keys.p, fp.kstride,
+                      fp.bkeys.p, fp.kstride / 8, top, ps, scratch.p, true, g_s, cand);
+    same("keys (pages)", f.keys, fp.keys);
+    same("top (pages)", f.top, fp.top);
+    same("top keys (pages)", f.tkey, fp.tkey);
+    if (pool) {
+      same("block maxima (pages)", f.bkeys, fp.bkeys);
+      same("pool (pages)", f.pool, fp.pool);
+      same("pool keys (pages)", f.pkey, fp.pkey);
+    }
+    same("scratch left zero (pages)", scratch, Dev<uint32_t>(scratch.n));
+    const attn::IndexKeys pik2 = pg.ik(1);
+    IdxBufs r2(rows, c2.kstride(), kTopk, kPool), fp2(rows, c2.kstride(), kTopk, kPool);
+    attn::IndexSel top2{kTopk, r2.top.p, r2.tkey.p, kTopk};
+    attn::IndexSel top3{kTopk, fp2.top.p, fp2.tkey.p, kTopk};
+    for (int rep = 0; rep < 2; ++rep)  // the scratch is left zero
+      attn::index_dense(c2.iq.p, c2.wp.p, c2.pos.p, c2.tab.p, rows, 2, c2.ik(), c2.max_scan, r2.keys.p, c2.kstride(),
+                        r2.bkeys.p, c2.kstride() / 8, top2, attn::IndexSel{}, scratch.p, true, g_s, cand);
+    attn::index_dense(c2.iq.p, c2.wp.p, c2.pos.p, c2.tab.p, rows, 2, pik2, c2.max_scan, fp2.keys.p, c2.kstride(),
+                      fp2.bkeys.p, c2.kstride() / 8, top3, attn::IndexSel{}, scratch.p, true, g_s, cand);
+    same("keys (pages source 1)", r2.keys, fp2.keys);
+    same("top (pages source 1)", r2.top, fp2.top);
+    same("top keys (pages source 1)", r2.tkey, fp2.tkey);
+  }
   end();
 }
 
@@ -598,6 +742,31 @@ void test_dense_blocks(int rows, int ctx, int cand) {
     same("top keys as calls of 8 rows", f.tkey, g.tkey);
   }
   same("scratch left zero", scratch, Dev<uint32_t>(scratch.n));
+  if (g_paged) {  // the same block scan with the keys in the pool's pages: the ratio-1 source and source 1
+    IdxCase c2(rows, 2, ctx, -1, false);  // source 1's distinct state, a dense scan (blocks are ratio 1's)
+    Pages pg(c2.cap, c.cap, 3);
+    pg.put(2, c.ik_k.p), pg.put(3, c.ik_sc.p);
+    pg.put(1, 2, c2.ik_k.p), pg.put(1, 3, c2.ik_sc.p);
+    IdxBufs fp(rows, c.kstride(), kTopk, kPool);
+    attn::IndexSel top{kTopk, fp.top.p, fp.tkey.p, kTopk};
+    attn::index_dense_blocks(c.iq.p, c.wp.p, c.pos.p, c.tab.p, rows, 1, pg.ik(), c.scan.blocks, c.scan.nblocks,
+                             fp.keys.p, fp.kstride, top, scratch.p, true, g_s, cand);
+    same("keys (pages)", f.keys, fp.keys);
+    same("top (pages)", f.top, fp.top);
+    same("top keys (pages)", f.tkey, fp.tkey);
+    same("scratch left zero (pages)", scratch, Dev<uint32_t>(scratch.n));
+    const attn::IndexKeys pik2 = pg.ik(1);
+    IdxBufs r2(rows, c2.kstride(), kTopk, kPool), fp2(rows, c2.kstride(), kTopk, kPool);
+    attn::IndexSel top2{kTopk, r2.top.p, r2.tkey.p, kTopk}, top3{kTopk, fp2.top.p, fp2.tkey.p, kTopk};
+    for (int rep = 0; rep < 2; ++rep)  // the scratch is left zero
+      attn::index_dense(c2.iq.p, c2.wp.p, c2.pos.p, c2.tab.p, rows, 2, c2.ik(), c2.max_scan, r2.keys.p, c2.kstride(),
+                        r2.bkeys.p, c2.kstride() / 8, top2, attn::IndexSel{}, scratch.p, true, g_s, cand);
+    attn::index_dense(c2.iq.p, c2.wp.p, c2.pos.p, c2.tab.p, rows, 2, pik2, c2.max_scan, fp2.keys.p, c2.kstride(),
+                      fp2.bkeys.p, c2.kstride() / 8, top3, attn::IndexSel{}, scratch.p, true, g_s, cand);
+    same("keys (pages source 1)", r2.keys, fp2.keys);
+    same("top (pages source 1)", r2.top, fp2.top);
+    same("top keys (pages source 1)", r2.tkey, fp2.tkey);
+  }
   end();
 }
 
@@ -677,6 +846,24 @@ void test_attn(int rows, int kmax, int splits) {
   attn::sparse_attn(q.p, pos.p, {}, rows, tab.p, ring.win(), ckv, topk.p, kmax, sink.p, of.p, splits, scratch, g_s,
                     true);
   same("out", ou, of);
+  if (g_paged) {  // the same attention with the entries in the pool's pages: sources 0 and 1
+    Dev<uint8_t> ckv2_kv((size_t)cap * kHead / 2), ckv2_sc((size_t)cap * 32);
+    fill::u8(ckv2_kv, 0xFF, 0);
+    fill::u8(ckv2_sc, 0x1F, 0x28);
+    Pages pg(cap, cap, 0);
+    pg.put(0, ckv_kv.p), pg.put(1, ckv_sc.p);
+    pg.put(1, 0, ckv2_kv.p), pg.put(1, 1, ckv2_sc.p);
+    Dev<uint16_t> ofp((size_t)rows * attn::kHeads * kHead);
+    attn::sparse_attn(q.p, pos.p, {}, rows, tab.p, ring.win(), pg.ckv(), topk.p, kmax, sink.p, ofp.p, splits, scratch,
+                      g_s, true);
+    same("out (pages)", of, ofp);
+    Dev<uint16_t> of2((size_t)rows * attn::kHeads * kHead), ofp2((size_t)rows * attn::kHeads * kHead);
+    attn::sparse_attn(q.p, pos.p, {}, rows, tab.p, ring.win(), attn::Compressed{ckv2_kv.p, ckv2_sc.p, cap}, topk.p,
+                      kmax, sink.p, of2.p, splits, scratch, g_s, true);  // source 1's reference
+    attn::sparse_attn(q.p, pos.p, {}, rows, tab.p, ring.win(), pg.ckv(1), topk.p, kmax, sink.p, ofp2.p, splits, scratch,
+                      g_s, true);
+    same("out (pages source 1)", of2, ofp2);
+  }
   end();
 }
 
@@ -711,10 +898,17 @@ void test_chain(int rows, int ratio, int ctx) {
   auto tab = table(ctx + 1, true);
   Ring ring_u;
   CompState cu(ratio, ctx + 1);
+  CompState cu2(2, ctx + 1);  // the pool's second ratio-2 source (source 1)
   IdxCase full(rows, ratio, ctx, 0, false);  // its keys/iq/wp are replaced by the chain's
   sync();
   Ring ring_f(ring_u);
-  CompState cf = cu.copy();
+  CompState cf = cu.copy(), cf2 = cu2.copy();
+  const int src = ratio == 1 ? 3 : 0;
+  Pages pg(cu2.cap, cu.cap, src);  // --pages: the fused side's caches in the pool's pages
+  if (g_paged) {
+    pg.put(0, cf.ckv_kv.p), pg.put(1, cf.ckv_sc.p), pg.put(2, cf.ik_k.p), pg.put(3, cf.ik_sc.p);
+    pg.put(1, 0, cf2.ckv_kv.p), pg.put(1, 1, cf2.ckv_sc.p), pg.put(1, 2, cf2.ik_k.p), pg.put(1, 3, cf2.ik_sc.p);
+  }
   const int ts = kParts * kTopk, pls = kParts * kPool;
   IdxBufs iu(rows, full.kstride(), ts, pls), ifu(rows, full.kstride(), ts, pls);
   Dev<int> top_u(rows * kTopk), top_f(rows * kTopk), pool_u(rows * kPool), pool_f(rows * kPool);
@@ -725,7 +919,8 @@ void test_chain(int rows, int ratio, int ctx) {
   attn::AttnScratch scratch{po.p, pml.p, max_splits};
   // the index source's keys: this layer's own cache (with the entry the emit of this step writes)
   IdxCase& c = full;
-  attn::IndexKeys ik_u = cu.ik(), ik_f = cf.ik();
+  attn::IndexKeys ik_u = cu.ik(), ik_f = g_paged ? pg.ik() : cf.ik();
+  const attn::Compressed ckv_f = g_paged ? pg.ckv() : cf.ckv();  // the fused side's caches
   // ---- separate kernels
   Dev<uint16_t> y((size_t)rows * kHcDim), yn((size_t)rows * kDim), qr((size_t)rows * attn::kQLora);
   Dev<float> chunks((size_t)nch * rows * 25), part(rows * 25), pre(rows * 4), po_(rows * 4), cb(rows * 16);
@@ -743,6 +938,9 @@ void test_chain(int rows, int ratio, int ctx) {
   attn::kv_write(kvp.p, kvw.p, pos.p, tab.p, ring_u.win(), nullptr, rows, g_s);
   attn::compressor_emit(proj.p, score.p, pos.p, rows, cu.cw(nullptr, nullptr), cu.carry(), tab.p, cu.ckv(), ik_u,
                         nullptr, 0, g_s);
+  if (g_paged)  // source 1's reference: the same emit on its own contiguous state
+    attn::compressor_emit(proj.p, score.p, pos.p, rows, cu2.cw(nullptr, nullptr), cu2.carry(), tab.p, cu2.ckv(),
+                          cu2.ik(), nullptr, 0, g_s);
   attn::gemv_bf16(yn.p, rows, kDim, wproj.p, nullptr, 32, 32, wp.p, nullptr, true, g_s);
   CUDA_CHECK(cudaMemcpyAsync(c.wp.p, wp.p, wp.n * 4, cudaMemcpyDeviceToDevice, g_s));
   c.ik_k = clone(cu.ik_k);  // with this step's entry
@@ -799,7 +997,7 @@ void test_chain(int rows, int ratio, int ctx) {
   a.cscore = score.p;
   a.cw = cf.cw(nullptr, nullptr);
   a.carry = cf.carry();
-  a.ckv = cf.ckv();
+  a.ckv = ckv_f;
   a.ik = ik_f;
   a.x = yn2.p;
   a.wproj = wproj.p;
@@ -814,7 +1012,7 @@ void test_chain(int rows, int ratio, int ctx) {
                     pool ? ifu.bkeys.p : nullptr, ifu.kstride / 8, top, psel, counters.p, true, g_s);
   attn::index_merge2(rows, ifu.top.p, ifu.tkey.p, ts, {kTopk, top_f.p, tk_f.p, kTopk}, ifu.pool.p, ifu.pkey.p, pls,
                      pool ? attn::IndexSel{kPool, pool_f.p, pk_f.p, kPool} : attn::IndexSel{}, true, g_s);
-  attn::sparse_attn(qpre.p, pos.p, {}, rows, tab.p, ring_f.win(), cf.ckv(), top_f.p, kTopk, sink.p, out_f.p, 10,
+  attn::sparse_attn(qpre.p, pos.p, {}, rows, tab.p, ring_f.win(), ckv_f, top_f.p, kTopk, sink.p, out_f.p, 10,
                     scratch, g_s, true);
   if (pool) {
     attn::IndexScan rs;
@@ -822,7 +1020,7 @@ void test_chain(int rows, int ratio, int ctx) {
     rs.nblocks = kPool;
     attn::index_fused(re.iq.p, re.wp.p, pos.p, tab.p, rows, ratio, ik_f, rs, kPool * 8, rf.keys.p, rf.kstride, nullptr,
                       0, {kTopk, rf.top.p, rf.tkey.p, kTopk}, {}, counters.p, true, g_s);
-    attn::sparse_attn(qpre.p, pos.p, {}, rows, tab.p, ring_f.win(), cf.ckv(), rf.top.p, kTopk, wsink.p, out_r_f.p, 10,
+    attn::sparse_attn(qpre.p, pos.p, {}, rows, tab.p, ring_f.win(), ckv_f, rf.top.p, kTopk, wsink.p, out_r_f.p, 10,
                       scratch, g_s, true);
   }
   same("stream", y, y2);
@@ -838,7 +1036,33 @@ void test_chain(int rows, int ratio, int ctx) {
   same("head weights", wp, wp2);
   same("ring", ring_u.kv, ring_f.kv);
   same("ring scales", ring_u.sc, ring_f.sc);
-  cu.check(cf, "compressor");
+  if (g_paged) {  // the fused side's caches are in the pool's pages
+    Dev<uint8_t> gkv(cu.ckv_kv.n), gsc(cu.ckv_sc.n), gik(cu.ik_k.n), giks(cu.ik_sc.n);
+    pg.get(0, gkv.p), pg.get(1, gsc.p), pg.get(2, gik.p), pg.get(3, giks.p);
+    same("compressor ckv (pages)", cu.ckv_kv, gkv);
+    same("compressor ckv scales (pages)", cu.ckv_sc, gsc);
+    same("compressor index keys (pages)", cu.ik_k, gik);
+    same("compressor index key scales (pages)", cu.ik_sc, giks);
+    same("compressor carry kv (pages)", cu.carry_kv, cf.carry_kv);
+    same("compressor carry score (pages)", cu.carry_sc, cf.carry_sc);
+    // source 1 (ratio 2): a distinct state in the same pages, the same decode_prep
+    attn::DecodePrep a2 = a;
+    a2.cw = cf2.cw(nullptr, nullptr);
+    a2.carry = cf2.carry();
+    a2.ckv = pg.ckv(1);
+    a2.ik = pg.ik(1);
+    attn::decode_prep(a2, rows, true, g_s);
+    Dev<uint8_t> gkv2(cu2.ckv_kv.n), gsc2(cu2.ckv_sc.n), gik2(cu2.ik_k.n), giks2(cu2.ik_sc.n);
+    pg.get(1, 0, gkv2.p), pg.get(1, 1, gsc2.p), pg.get(1, 2, gik2.p), pg.get(1, 3, giks2.p);
+    same("compressor ckv (pages source 1)", cu2.ckv_kv, gkv2);
+    same("compressor ckv scales (pages source 1)", cu2.ckv_sc, gsc2);
+    same("compressor index keys (pages source 1)", cu2.ik_k, gik2);
+    same("compressor index key scales (pages source 1)", cu2.ik_sc, giks2);
+    same("compressor carry kv (pages source 1)", cu2.carry_kv, cf2.carry_kv);
+    same("compressor carry score (pages source 1)", cu2.carry_sc, cf2.carry_sc);
+  } else {
+    cu.check(cf, "compressor");
+  }
   same("candidates", iu.top, ifu.top);
   same("candidate keys", iu.tkey, ifu.tkey);
   same("top", top_u, top_f);
@@ -856,7 +1080,13 @@ void test_chain(int rows, int ratio, int ctx) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i) {
+    if (!std::strcmp(argv[i], "--pages")) g_pages = true;
+    else if (!std::strcmp(argv[i], "--pages-badlayout")) g_bad = true;
+    else die("fused_tests: unknown argument %s", argv[i]);
+  }
+  g_paged = g_pages || g_bad;
   CUDA_CHECK(cudaStreamCreate(&g_s));
   for (int rows : {1, 6, 8, 9, 12, 16}) {
     const bool one_session = rows <= attn::kDecodeGroup;  // decode_prep: at most 8 rows a session
@@ -895,6 +1125,7 @@ int main() {
       test_chain(rows, 1, 41000);
     }
   }
-  std::printf("%d checks, %d differ: %s\n", g_checks, g_fail, g_fail ? "FAILED" : "PASSED");
+  std::printf("%s%d checks, %d differ: %s\n", g_bad ? "with the bad layout (must fail): " : "", g_checks, g_fail,
+              g_fail ? "FAILED" : "PASSED");
   return g_fail ? 1 : 0;
 }

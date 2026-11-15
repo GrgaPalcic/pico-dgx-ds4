@@ -46,16 +46,21 @@
 //                spilled to a file of --disk-gib (default 32; 0: none) in --disk-dir (default the
 //                fleet file's RANK<r>_SPILL), prefill in
 //                chunks of --prefill-rows (default 8192 with CED, else 4096 as in the other modes),
-//                sampled decode. --keep-gib N: a planned stop (SIGTERM) keeps the sessions for the
-//                next start (docs/engine.md, "Kept sessions"): those in the file, and those in device
-//                memory, the most recently used first, up to N GiB written at the stop (default 0:
-//                nothing is kept), none unused for --keep-days (7); --disk-tag T names the files
-//                rank<r>.T.spill and .index (rank 0's server.T.index), so that runs of another tag
-//                never touch them (the service's: service). --slots N: up to N requests decode
-//                together, a row each per step (one alone: with drafts). --slice N: a request that
-//                comes while others decode pauses them and is prefilled; while more requests decode
-//                than there are slots, they take turns of N tokens (default 64; 0: no turns, and a
-//                request that would need the slot of another in flight waits for one to free)
+//                sampled decode. Durable copies (TS2): every finished turn is written through to a
+//                copy in the disk tier's file, named by one index file per session per rank
+//                (rank<r>.T.d/<h>.<seq>.c), so a kill -9, a watchdog restart or a power cut loses at
+//                most the turn in flight; the next start reads them back (docs/engine.md, "The disk
+//                tier"), and a session unused for --keep-days (7) is not recovered; --disk-tag T names
+//                the files rank<r>.T.spill and rank<r>.T.d/ (rank 0's server.T.d/), so that runs of
+//                another tag never touch them (the service's: service). --slots N: up to N requests
+//                decode together, a row each per step (one alone: with drafts). --slice N: a request
+//                that comes while others decode pauses them and is prefilled; while more requests
+//                decode than there are slots, they take turns of N tokens (default 64; 0: no turns,
+//                and a request that would need the slot of another in flight waits for one to free)
+//   --stats-file FILE (serve): rank 0 appends one JSON line of the store's counters (sessions, the
+//                pool's and the disk tier's GiB, spills, unspills, disk drops, sessions read back at
+//                startup, copy-on-write pages, turns copied through, and the sessions freed without a
+//                disk tier) every 600 s when a counter changed, and once at a planned stop; mode 0600
 //   generate --loop: the generation runs through the decode loop (same tokens as without)
 //   --spec: DSpark drafts (mtp.* loaded) in the decode loop (decode, generate --loop; serve runs them
 //     unless --no-spec: they change the speed, never the tokens), at most
@@ -126,6 +131,7 @@
 #include "dspark/dspark.h"
 #include "engram/engram.h"
 #include "model/model.h"
+#include "model/pages.h"
 #include "server/cmd.h"
 #include "server/golden.h"
 #include "server/serve.h"
@@ -286,11 +292,13 @@ struct Args {
   int top_k = 0;
   uint32_t seed = 1;
   std::string socket = "/tmp/dsgb10-engine.sock";
-  double session_gib = 12, session_margin_gib = 2;
+  double session_gib = model::detail::kSessionGib, session_margin_gib = 2;
+  bool session_gib_given = false;  // --session-gib was on the command line (under the flag it caps the pool)
   double disk_gib = 32;  // serve: the store's disk tier (0: none)
   std::string disk_dir;  // its directory (default: the fleet's RANK<r>_SPILL)
   std::string disk_tag;  // its files' tag: rank<r>.<tag>.spill (none: rank<r>.spill)
-  double keep_gib = 0, keep_days = 7;  // kept sessions: written at a planned stop, at most; their age
+  double keep_days = 7;  // the copies' age limit: a session unused for longer is not recovered
+  std::string stats_file;  // --stats-file: the store counters' JSON lines (rank 0; empty: none)
   int snap_every = 1024, small_rows = 8;
   int slots = 1, slot = 0;
   int big_slots = 0;  // --big-slots B: slots [0, B) hold --max-ctx, the others --max-ctx / 8 (model::Options::big_slots)  // session slots (model::Options::slots); the golden modes' slot
@@ -303,6 +311,7 @@ struct Args {
   size_t ring_cap = 4u << 20;  // the ring's per-rank collective size (prefill's bulk collectives post cap / 4)
   bool spec = false, no_spec = false, draft_fp8 = false, draft_bf16 = false, draft_head4 = false, draft_markov8 = false;
   bool head_raw = false, no_l2pf = false;
+  bool shared_kv = false;  // --shared-kv: one KV pool, the slot tables and the pages (docs/shared-kv.md)
   std::string draft_weights;  // --draft-weights FILE: the drafter (mtp.*) from this rank file instead of --weights
   int spec_drafts = 5;
   float spec_thresh = -1.f;
@@ -376,13 +385,13 @@ Args parse(int argc, char** argv) {
     else if (s == "--top-p") a.top_p = std::atof(val().c_str());
     else if (s == "--top-k") a.top_k = std::atoi(val().c_str());
     else if (s == "--socket") a.socket = val();
-    else if (s == "--session-gib") a.session_gib = std::atof(val().c_str());
+    else if (s == "--session-gib") a.session_gib = std::atof(val().c_str()), a.session_gib_given = true;
     else if (s == "--session-margin-gib") a.session_margin_gib = std::atof(val().c_str());
     else if (s == "--disk-gib") a.disk_gib = std::atof(val().c_str());
     else if (s == "--disk-dir") a.disk_dir = val();
     else if (s == "--disk-tag") a.disk_tag = val();
-    else if (s == "--keep-gib") a.keep_gib = std::atof(val().c_str());
     else if (s == "--keep-days") a.keep_days = std::atof(val().c_str());
+    else if (s == "--stats-file") a.stats_file = val();
     else if (s == "--snap-every") a.snap_every = std::atoi(val().c_str());
     else if (s == "--slots") a.slots = std::atoi(val().c_str());
     else if (s == "--big-slots") a.big_slots = std::atoi(val().c_str());
@@ -412,6 +421,7 @@ Args parse(int argc, char** argv) {
     else if (s == "--chain-every") a.chain_every = std::atoi(val().c_str());
     else if (s == "--head-raw") a.head_raw = true;
     else if (s == "--no-l2pf") a.no_l2pf = true;
+    else if (s == "--shared-kv") a.shared_kv = true;
     else if (s == "--setenv") {
       const std::string v = val();
       const size_t eq = v.find('=');
@@ -443,7 +453,7 @@ Args parse(int argc, char** argv) {
   if (!a.prefill_rows) a.prefill_rows = a.mode == "serve" && !a.exact ? 8192 : 4096;
   if (a.disk_tag.size() > 32 || a.disk_tag.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_-") != std::string::npos)
     die("--disk-tag: at most 32 of a-z, 0-9, _ and -");
-  if (a.keep_gib < 0 || !(a.keep_days > 0)) die("--keep-gib must be >= 0 and --keep-days > 0");
+  if (!(a.keep_days > 0)) die("--keep-days must be > 0");
   if (a.slice < 0) die("--slice must be >= 0");
   // this box's rank and files: the fleet file's, unless given
   const comm::Fleet& fl = comm::fleet(a.fleet);
@@ -495,6 +505,12 @@ Args parse(int argc, char** argv) {
     die("--route-file FILE [--route-every 1..%d] [--chain-every N] [--props FILE]: --mode spectf only",
         model::kMaxSessRows);
   if (a.spec_drafts < 0 || a.spec_drafts > model::ops::kDrafts) die("--spec-drafts must be 0..5");
+  if (a.shared_kv) {  // docs/shared-kv.md §2.9: what the pool cannot be with
+    if (a.big_slots > 0) die("--shared-kv with --big-slots %d: every slot holds the whole context", a.big_slots);
+    if (a.session_gib <= 0) die("--shared-kv with --session-gib 0: the pool holds the sessions' state");
+    if (a.max_ctx % model::detail::kPagePos)
+      die("--shared-kv with --max-ctx %d: a multiple of %d", a.max_ctx, model::detail::kPagePos);
+  }
   if (a.spec && (a.mode == "decode" || a.mode == "generate") && !a.big)
     die("--spec: the prompt goes through the prefill path (--big), which fills the draft module's windows");
   for (int k : a.ks) {
@@ -532,7 +548,11 @@ uint64_t run_id(const Args& a) {
   if (!a.no_engram) file(a.hashmap), file(a.shard[0]), file(a.shard[1]);
   const int64_t o[] = {a.max_ctx, a.exact, a.spec, a.draft_fp8, a.prefill_rows, a.small_rows, a.snap_every,
                        a.no_engram, a.layers, a.first, (int64_t)a.ring_cap, a.draft_head4, a.draft_markov8};
-  return keepfile::fnv(o, sizeof o, h);
+  h = keepfile::fnv(o, sizeof o, h);
+  // --shared-kv: a flag-on run's sessions are pool pages, so it never reads a flag-off kept file, and a
+  // flag-off run's id (and its kept files) stay exactly as they were
+  if (a.shared_kv) h = keepfile::fnv("shared-kv", 9, h);
+  return h;
 }
 
 // /proc/meminfo's MemAvailable (free pages and the page cache the kernel can reclaim), bytes
@@ -589,6 +609,7 @@ int main(int argc, char** argv) {
   mo.tree_probe = !a.tree_probe.empty();
   mo.slots = a.slots;
   mo.big_slots = a.big_slots;
+  mo.shared_kv = a.shared_kv;
   mo.bgraph_bodies = a.bgraph_bodies, mo.bgraph_noif = a.bgraph_noif, mo.bgraph_check = a.bgraph_check;
   mo.l2pf = !a.no_l2pf;
   model::Model m(a.rank, mo);
@@ -668,6 +689,17 @@ int main(int argc, char** argv) {
       std::printf("free device memory after the prefill buffers, ranks 0-3: %.2f %.2f %.2f %.2f GiB\n",
                   all[0] / 1073741824.0, all[1] / 1073741824.0, all[2] / 1073741824.0, all[3] / 1073741824.0);
   }
+  // --shared-kv outside serve: no store, but the live slots' caches are the pool's pages, so the pool is
+  // reserved for the run (docs/shared-kv.md §2.9: --max-ctx / 4096 + 8 pages, and the flag's own blocks)
+  if (a.shared_kv && a.mode != "serve") {
+    const uint64_t pages = (uint64_t)a.max_ctx / model::detail::kPagePos + 8;
+    m.state_reserve(pages * model::detail::kPageBlock +
+                    model::detail::shared_kv_overhead(a.slots, a.max_ctx));
+    // The golden and bench modes drive the server's loops on slots no request ever took, so every slot
+    // gets a session of its own: slot s takes the handle -(s + 1). The server's handles are >= 1
+    // (serve.cpp's next_h_), so the two ranges cannot meet, and 0 keeps its meaning of "no session".
+    for (int s = 0; s < a.slots; ++s) m.state_slot_row(s, -(s + 1));
+  }
   // 6. serve: nothing takes device memory after startup (DESIGN.md's hardening list: CUDA takes only free
   // pages, and the page cache grows into them). The spec step's graphs of every context bucket first, then
   // the sessions' store: each rank offers its free device memory and its available host memory
@@ -681,48 +713,77 @@ int main(int argc, char** argv) {
     const double gib = 1073741824.0;
     // the store's disk tier first, as its staging is pinned host memory: each rank offers its directory's
     // free space less 32 GiB (its own file counted as free), at most --disk-gib; every rank takes the
-    // smallest offer (under 1 GiB: none). Kept sessions: when every rank's index of an earlier planned
-    // stop checks out (state_kept_check) with the same generation, and its file fits every offer, every
-    // rank opens that file as it is; anything else starts clean and removes the kept files, as does
-    // --keep-gib 0 (nothing kept, nothing taken back).
+    // smallest offer (under 1 GiB: none). Durable copies: each rank's index files (base.d/<h>.<seq>.c) of
+    // an earlier run are read when every rank's file is the same size and fits every offer, and the
+    // sessions they name come back; anything else starts clean, as does a changed run id (a new binary,
+    // weights or options) or --disk-gib 0.
     const bool disk = a.disk_gib > 0 && !in_git_tree(disk_dir);
     if (a.disk_gib > 0 && !disk) std::printf("rank %d: no disk tier: %s is in a git tree\n", a.rank, disk_dir.c_str());
     if (disk) {
       const uint64_t fr = spill_free(disk_dir, disk_base), margin = 32ull << 30;
-      size_t kbytes = 0;
-      std::string why;
       const double tk0 = now_s();
       const uint64_t id = run_id(a);
+      const uint64_t planned = std::min<uint64_t>((uint64_t)(a.disk_gib * gib), fr > margin ? fr - margin : 0);
+      const uint64_t existing = m.state_recover_begin(disk_base, id);
       const double tk1 = now_s();
-      const uint64_t gen = a.keep_gib > 0 ? m.state_kept_check(disk_base, id, a.keep_days * 86400, &kbytes, &why) : 0;
-      const double tk2 = now_s();
-      if (!why.empty()) std::printf("rank %d: kept sessions: none reused (%s)\n", a.rank, why.c_str());
-      const uint64_t mine[3] = {std::min<uint64_t>((uint64_t)(a.disk_gib * gib), fr > margin ? fr - margin : 0), gen,
-                                kbytes};
-      uint64_t all[4][3];
+      const uint64_t mine[2] = {planned, existing};
+      uint64_t all[4][2];
       ring.allgather_host(mine, all, sizeof mine);
-      uint64_t bytes = mine[0];
-      bool reuse = gen != 0;
-      for (const auto& x : all) bytes = std::min(bytes, x[0]), reuse = reuse && x[1] == gen && x[2] == kbytes;
-      reuse = reuse && kbytes <= bytes;
-      if (reuse) bytes = kbytes;
-      if (bytes >= (1ull << 30)) m.state_disk(disk_base, bytes, 512ull << 20, reuse, id);
+      uint64_t bytes = planned;
+      bool reuse = existing > 0;
+      for (const auto& x : all) bytes = std::min(bytes, x[0]), reuse = reuse && x[1] == existing;
+      reuse = reuse && existing <= bytes;
+      if (reuse) bytes = existing;
+      std::vector<std::pair<int, uint64_t>> kept;
+      if (reuse) {  // what this rank has: the ranks then agree on the intersection, highest seq a session
+        const std::vector<std::pair<int, uint64_t>> pairs = m.state_recover_scan(a.keep_days * 86400);
+        const size_t n = pairs.size();
+        uint64_t mine_n = n, all_n[4];
+        ring.allgather_host(&mine_n, all_n, sizeof mine_n);
+        size_t N = 0;
+        for (int r = 0; r < 4; ++r) N = std::max(N, (size_t)all_n[r]);
+        std::map<std::pair<int, uint64_t>, int> seen;  // (h, seq): how many ranks have that copy
+        for (size_t at = 0; at < N; at += 2048) {  // 2048 pairs: 32 KiB, the bootstrap sockets' limit
+          const size_t m = std::min<size_t>(2048, N - at);
+          std::vector<uint64_t> mv(2 * m, 0), av(8 * m);
+          for (size_t i = 0; i < m && at + i < n; ++i)
+            mv[2 * i] = (uint64_t)(uint32_t)pairs[at + i].first, mv[2 * i + 1] = pairs[at + i].second;
+          ring.allgather_host(mv.data(), av.data(), mv.size() * sizeof(uint64_t));
+          for (int r = 0; r < 4; ++r)
+            for (size_t i = 0; i < m; ++i) {
+              const int h = (int)(uint32_t)av[r * 2 * m + 2 * i];
+              if (!h) continue;  // the padding above this rank's count
+              ++seen[{h, av[r * 2 * m + 2 * i + 1]}];
+            }
+        }
+        // every rank has the copy; of a session's copies so (a crash can leave an older one beside the
+        // newest), the highest seq
+        std::map<int, uint64_t> best;
+        for (const auto& [hs, cnt] : seen)
+          if (cnt == 4) best[hs.first] = std::max(best[hs.first], hs.second);
+        for (const auto& [h, sq] : best) kept.emplace_back(h, sq);
+      }
+      const bool open = bytes >= (1ull << 30);
+      if (!reuse || !open) m.state_recover_clean();  // an earlier run's file and copies go
+      if (open) {
+        m.state_disk(disk_base, bytes, 512ull << 20, reuse, id);
+        if (reuse) m.state_recover_take(kept);
+      }
       std::printf("session store's disk tier: %.1f GiB in %s (at most %.1f; free space less 32 GiB, ranks 0-3: "
                   "%.0f %.0f %.0f %.0f GiB)\n", m.state_disk_capacity() / gib,
                   m.state_disk_capacity() ? m.state_disk_path().c_str() : "(none)", a.disk_gib, all[0][0] / gib,
                   all[1][0] / gib, all[2][0] / gib, all[3][0] / gib);
       if (a.rank == 0)
-        std::printf("kept sessions: %s (generations of ranks 0-3: %016llx %016llx %016llx %016llx; the run id %016llx "
-                    "in %.1f ms, this rank's index checked in %.1f ms)\n",
-                    reuse && m.state_disk_capacity() ? "the files of the last planned stop are reused" : "none, a clean start",
-                    (unsigned long long)all[0][1], (unsigned long long)all[1][1], (unsigned long long)all[2][1],
-                    (unsigned long long)all[3][1], (unsigned long long)id, 1e3 * (tk1 - tk0), 1e3 * (tk2 - tk1));
-    }
-    if (!m.state_disk_capacity()) {  // no disk tier: nothing kept stays
+        std::printf("copies: %s (the run id %016llx in %.1f ms, this rank's %zu index files read in %.1f ms)\n",
+                    open && reuse ? "the copies of the last run are reused" : "none, a clean start",
+                    (unsigned long long)id, 1e3 * (tk1 - tk0), kept.size(), 1e3 * (now_s() - tk1));
+    } else {  // no disk tier: nothing is kept, and an earlier run's copies go
       std::error_code ec;
       std::filesystem::remove(disk_base + ".spill", ec);
       std::filesystem::remove(disk_base + ".index", ec);
       std::filesystem::remove(disk_base + ".index.new", ec);
+      std::filesystem::remove_all(disk_base + ".d", ec);
+      std::filesystem::remove_all(disk_dir + "/server" + disk_tag + ".d", ec);
     }
     size_t dfree = 0, dtotal = 0;
     CUDA_CHECK(cudaMemGetInfo(&dfree, &dtotal));
@@ -732,14 +793,36 @@ int main(int argc, char** argv) {
                               std::min(dfree > margin ? dfree - margin : 0, avail > margin + cache ? avail - margin - cache : 0)};
     uint64_t all[4][3];
     ring.allgather_host(mine, all, sizeof mine);
-    uint64_t pool = (uint64_t)(a.session_gib * gib);
+    // --shared-kv: the pool holds the sessions' pages and the flag's own blocks (the slot table and the
+    // zero page), so its cap is 12 GiB plus what --slots would have reserved for the live caches at this
+    // --max-ctx — the same total KV memory as flag off — or an explicit --session-gib as it is given,
+    // bounded by the ranks' offers (docs/shared-kv.md §2.9; the offers were measured with the slots'
+    // caches unallocated).
+    const uint64_t cap = a.shared_kv
+                             ? model::detail::shared_kv_cap(a.session_gib, a.session_gib_given, a.slots, a.big_slots,
+                                                            a.max_ctx)
+                             : (uint64_t)(a.session_gib * gib);
+    uint64_t pool = cap;
     for (const auto& r : all) pool = std::min(pool, r[2]);
     m.state_reserve(pool);
     if (a.rank == 0) {
       std::printf("session store: %.2f GiB on every rank (at most %.1f; free device / available host memory before "
-                  "it, ranks 0-3:", m.state_capacity() / gib, a.session_gib);
+                  "it, ranks 0-3:", m.state_capacity() / gib, a.shared_kv ? cap / gib : a.session_gib);
       for (const auto& r : all) std::printf(" %.2f / %.2f", r[0] / gib, r[1] / gib);
       std::printf(" GiB, less a margin of %.1f and the Engram cache's %.1f)\n", margin / gib, cache / gib);
+      if (a.shared_kv) {  // the flag's rule, its pool and what it holds (no request content)
+        char atmost[96];
+        if (a.session_gib_given)
+          std::snprintf(atmost, sizeof atmost, "%.2f", a.session_gib);
+        else
+          std::snprintf(atmost, sizeof atmost, "%.2f + the slots' %.2f", (double)model::detail::kSessionGib,
+                        (double)model::detail::slot_caches_bytes(a.slots, a.big_slots, a.max_ctx) / gib);
+        const int pages = model::detail::pool_pages(m.state_capacity(), a.slots, a.max_ctx);
+        std::printf("shared KV: %.2f GiB on every rank (at most %s; %d pages of %.1f MiB, %lld positions; %d slot "
+                    "rows of %d, and one %.1f MiB zero page)\n", m.state_capacity() / gib, atmost, pages,
+                    model::detail::kPageBlock / 1048576.0, (long long)pages * model::detail::kPagePos, a.slots,
+                    model::detail::max_pages_of(a.max_ctx), model::detail::kPageBlock / 1048576.0);
+      }
     }
   }
   ring.barrier();
@@ -763,9 +846,9 @@ int main(int argc, char** argv) {
     so.slice = a.slice;
     so.snap_thin = !a.snap_all;
     so.budget = (size_t)(a.session_gib * 1073741824.0);
-    so.keep_index = disk_dir + "/server" + disk_tag + ".index";
-    so.keep_bytes = std::min(m.state_disk_capacity(), (size_t)(a.keep_gib * 1073741824.0));  // none without a file
+    so.keep_dir = m.state_disk_capacity() ? disk_dir + "/server" + disk_tag + ".d" : "";
     so.keep_age_s = a.keep_days * 86400;
+    so.stats_file = a.stats_file;
     so.ced = !a.exact;
     so.spec = a.spec;
     so.spec_drafts = a.spec_drafts;
@@ -1005,6 +1088,10 @@ int main(int argc, char** argv) {
       int32_t first = 0;
       uint64_t hash = 1469598103934665603ull;  // as decode mode's chosen_hash over its decode
       std::vector<int32_t> out;
+      // batch-tf with DSGB10_TF_DUMP: the golden next token's place in the top 20 (-1: not in it) and its logprob
+      // (else the 20th's, an upper bound)
+      std::vector<int8_t> rank;
+      std::vector<float> lp;
     };
     std::vector<Sess> ss;
     for (const char* q = a.batch.c_str(); *q;) {
@@ -1043,10 +1130,12 @@ int main(int argc, char** argv) {
       // (--big --prompt C --k G --limit C + G * steps: the same (token, logit) folds in the same order).
       std::vector<BatchEntry> e(ss.size());
       std::vector<std::vector<int32_t>> t(ss.size());
+      const char* dump = getenv("DSGB10_TF_DUMP");
       for (size_t k = 0; k < ss.size(); ++k) {
         BatchEntry& x = e[k];
         x.slot = ss[k].slot, x.pos0 = ss[k].ctx, x.max_new = per, x.limit = a.max_ctx;
         x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = a.top_k, x.sp.seed = a.seed;
+        x.sp.n_top = dump ? model::ops::kTopLogprobs : 0;  // logprobs at T = 1 beside the sample, which is unchanged
         t[k].assign(toks.begin() + ss[k].ctx, toks.begin() + ss[k].ctx + per);
       }
       Cmd c{};
@@ -1057,6 +1146,18 @@ int main(int argc, char** argv) {
       bcast_tf(ring, c, e, t, 0);
       const std::vector<float> ms = batch_tf_loop(m, c, e, t, wd, [&](int k, const model::SampleOut& o, int row) {
         Sess& s = ss[k];
+        if (dump) {
+          const int32_t truth = toks[s.ctx + 1 + s.out.size()];  // in range: s.ctx + per < L
+          int8_t rk = -1;
+          float l = o.top_lp[row][model::ops::kTopLogprobs - 1];
+          for (int j = 0; j < model::ops::kTopLogprobs; ++j)
+            if (o.top_id[row][j] == truth) {
+              rk = (int8_t)j, l = o.top_lp[row][j];
+              break;
+            }
+          s.rank.push_back(rk);
+          s.lp.push_back(l);
+        }
         s.out.push_back(o.row[row].token);  // the sample at its position: the golden token after it when equal
         uint32_t bits;
         std::memcpy(&bits, &o.row[row].value, 4);
@@ -1064,11 +1165,12 @@ int main(int argc, char** argv) {
         s.hash = (s.hash ^ bits) * 1099511628211ull;
       });
       bcast(ring, Cmd{});  // stop
-      if (const char* dp = getenv("DSGB10_TF_DUMP")) {  // wide64 test: every session's samples, one line each
-        FILE* f = std::fopen(dp, "w");
+      if (dump) {  // every session's rows: argmax, the golden next token's rank in the top 20, its logprob
+        FILE* f = std::fopen(dump, "w");
         for (size_t k = 0; f && k < ss.size(); ++k) {
           std::fprintf(f, "%zu %d", k, ss[k].ctx);
-          for (int32_t t : ss[k].out) std::fprintf(f, " %d", t);
+          for (size_t i = 0; i < ss[k].out.size(); ++i)
+            std::fprintf(f, " %d,%d,%.6f", ss[k].out[i], ss[k].rank[i], ss[k].lp[i]);
           std::fprintf(f, "\n");
         }
         if (f) std::fclose(f);
@@ -1471,7 +1573,14 @@ int main(int argc, char** argv) {
             int i = 0;
             for (int v = 0; v < 2; ++v) {
               m.set_route_shift(v ? kRouteShift : 0, G);
-              for (int s = 0; s < a.steps; ++s, ++i, p += k) gg[v].push_back(tf_step(p, i, nullptr));
+              for (int s = 0; s < a.steps; ++s, ++i, p += k) {
+                // nsys --capture-range=cudaProfilerApi: the first context's and k's natural loop, from its 4th
+                // step on (the first 3 run eagerly or capture; tools: kprof drops each group's first 3 steps)
+                const bool start = c == 0 && j == 0 && v == 0 && s == 3;
+                if (start) CUDA_CHECK(cudaProfilerStart());
+                gg[v].push_back(tf_step(p, i, nullptr));
+              }
+              if (c == 0 && j == 0 && v == 0) CUDA_CHECK(cudaProfilerStop());
               for (int s = 0; s < 6; ++s, ++i, p += k) tf_step(p, i, a.rank == 0 ? &gs[v] : nullptr);
             }
             m.set_route_shift(0);

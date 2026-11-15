@@ -185,12 +185,11 @@ void Model::Impl::prefill_alloc(comm::Ring* ring) {
               M, (double)(free0 - free1) / 1073741824.0, free1 / 1073741824.0);
 }
 
-#ifdef DSGB10_NVTX
-// Profiling builds: DSGB10_ROUTE_DUMP=<dir> has rank 0 write each pass's routes (every row, after the
-// FFN's all-gather) to <dir>/a<pos>.m<M>.L<LL>.i32, int32 [M][6] (bench_kernels moereal's layout). It
-// synchronizes the stream once a layer: for counting the experts a turn touches, never for timing.
+// DSGB10_PREFILL_ROUTE_DUMP=<dir> (diagnostics, any build): rank 0 writes each pass's routes (every row,
+// after the FFN's all-gather) to <dir>/a<pos>.m<M>.L<LL>.i32, int32 [M][6] (bench_kernels moereal's layout).
+// It synchronizes the stream once a layer: for counting the experts a turn touches, never for timing.
 static const char* route_dump_dir() {
-  static const char* d = std::getenv("DSGB10_ROUTE_DUMP");
+  static const char* d = std::getenv("DSGB10_PREFILL_ROUTE_DUMP");
   return d && *d ? d : nullptr;
 }
 static int g_dump_a = -1;  // the pass's first position (the replay's: P - 128)
@@ -209,7 +208,6 @@ static void dump_routes(const Prefill& p, int L, int M, cudaStream_t st) {
   std::fwrite(rows.data(), 4, rows.size(), f);
   std::fclose(f);
 }
-#endif
 
 
 // ---- drafter2: feature dump for drafter self-distillation (DSGB10_FEAT_DUMP=<dir>; data collection only) ----
@@ -534,9 +532,7 @@ void Model::Impl::ffn_p(int L, int M) {
                              {p.ridx + (size_t)r0 * kTopK, p.ridx, (size_t)Q * kTopK * 4},
                              {p.rwts + (size_t)r0 * kTopK, p.rwts, (size_t)Q * kTopK * 4}};
   comm::allgather_multi(ch, ag, 4, st);
-#ifdef DSGB10_NVTX
   if (route_dump_dir() && rank == 0) dump_routes(p, L, M, st);
-#endif
   // the MoE (bucketing, shared expert, up), then down in column groups. Each group's combine and its
   // reduce-scatter by rows (fp32 sums in rank order, rounded to bf16) run as one kernel on the comm
   // stream under the next group's down; for chunks whose combine runs inside the down kernel
@@ -626,9 +622,7 @@ void Model::Impl::ced_replay(int P, const std::vector<std::pair<int, uint8_t*>>&
   NVTX_RANGE("replay P=%d", P);
   Prefill& p = *pf;
   const int s = P - kReplay, M = kReplay;
-#ifdef DSGB10_NVTX
   g_dump_a = s;
-#endif
   for (int q = s; q < P; ++q)
     if (p.ced_pos[q % kReplay] != q) die("model: CED replay of [%d, %d) without the encoder's position %d", s, P, q);
   p.rq = q_rows(M), p.r0 = rank * p.rq, p.n = std::max(0, std::min(p.rq, M - p.r0));
@@ -697,9 +691,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
     });
   if (ced && a != p.ced_end) std::fill(p.ced_pos, p.ced_pos + kReplay, -1);  // a new run of positions
   p.ced_end = ced ? a + M : -1;
-#ifdef DSGB10_NVTX
   g_dump_a = a;
-#endif
   for (int L = 0; L < (ced ? 20 : kLayers); ++L) {
     NVTX_RANGE("%s L%02d", ced ? "enc" : "ex", L);
     bool fresh = L == 0;

@@ -122,6 +122,9 @@ struct Options {
   int wave_probe_at = -1;  // at this position (wave_probe())
   bool draft_fp8 = false;   // DSpark's head GEMV on an FP8 copy of the vocab head (bind_spec; +165 MB): the
                             // drafts' arithmetic changes, the tokens cannot
+  bool shared_kv = false;   // --shared-kv (docs/shared-kv.md): the compressed caches, the index keys and the
+                            // store's pages are one pool, and a session takes or leaves a slot by a table
+                            // row; off by default (every path, launch, layout and hash as before)
   // The draft pass's cheaper formats (docs/engine.md, "The draft pass's approximations"; bundle B), drafts only:
   bool draft_head4 = false;    // the head as MXFP4, made from the FP8 copy (dspark::head_fp4; +88 MB, the FP8
                                // copy freed): the study's simulated FP4 head bit for bit
@@ -141,6 +144,18 @@ struct Options {
   // EXPERIMENT, bench only (docs/engine.md, "Draft trees"): every spec step's draft pass also runs the
   // drafter's probe (dspark::Draft::probe) along SpecCfg::probe, into SampleOut::probe
   bool tree_probe = false;
+};
+
+// The store's counters (state.h, `--stats-file`): what the disk tier and the shared pool did, since
+// this run started. Byte counts are the blocks' bytes as the store holds them.
+struct StoreStats {
+  uint64_t spills = 0, spill_bytes = 0;      // sessions spilled to the disk tier, and their bytes
+  uint64_t unspills = 0, unspill_bytes = 0;  // sessions read back from it, and their bytes
+  uint64_t disk_drops = 0;                   // sessions dropped from the file to make room
+  uint64_t kept_loaded = 0;                  // sessions taken back from the disk tier at startup
+  uint64_t cow = 0;                          // --shared-kv: copy-on-write page copies
+  uint64_t copies = 0, copy_bytes = 0;       // turns written through to a copy, and the blocks written
+  uint64_t recovered = 0;                    // sessions a start recovered from the index files
 };
 
 class Model {
@@ -267,6 +282,19 @@ class Model {
   // state_evicted() returns the sessions evicted since it was last called.
   void state_reserve(size_t bytes);
   size_t state_capacity() const;
+  // --shared-kv is on (Options::shared_kv; docs/shared-kv.md): the process-wide flag, for the server's
+  // budget and the eviction collection. Never changes after the model is built.
+  bool shared_kv() const;
+  // --shared-kv: room for the sessions live in the given slots up to `upto` positions (or each row's
+  // pos[r] + 1), the pages allocated now, in the same order on every rank. False: the pool has no room
+  // and nothing can be evicted, so the caller must not launch (the step or the chunk ends with an
+  // error). A slot with no session dies: state_slot_row puts one there. With the flag off this is a
+  // constant true and allocates nothing.
+  bool shared_kv_room(int slot, int upto);
+  bool shared_kv_room(const int* slot, const int* pos, int rows);
+  // --shared-kv: session h takes slot s, so the slot's table row becomes h's page list (§2.6); h = 0
+  // means the slot has no session (its row is all zero pages). Nothing with the flag off.
+  void state_slot_row(int s, int h);
   void state_pin(const std::vector<int>& h);
   std::vector<int> state_evicted();
   void state_save(int h, int from, int to);    // compressed caches of positions [from, to) -> session h
@@ -281,26 +309,33 @@ class Model {
   void state_drop_snap(int h, int pos);
   // The store's disk tier: base.spill of `bytes` (the same on every rank; an earlier file is removed
   // first, and this one at exit), with `staging` bytes of pinned memory for writes in flight. A session
-  // the store evicts is then spilled to it: its blocks are copied out after the work queued on the
-  // model's stream and freed at once, and a writer thread writes them. state_unspill, or an operation
-  // that needs a spilled session's blocks, reads it back, as far as the store has room. When the file is
-  // full, its least recently used sessions are dropped (state_evicted).
-  // Kept sessions (docs/engine.md): state_keep(gen), on every rank at a planned stop, syncs the file and
-  // writes base.index (the sessions in the file: their blocks and checksums, the run id, gen), and the
-  // file stays at exit. The next start's state_kept_check reads this rank's index: gen when it is whole,
-  // of this run_id (main.cpp: the binary, the weights, the options), at most max_age_s old and beside
-  // its file (whose size goes to *bytes), else 0 (*why: the reason, "" when there is none). With reuse
-  // (every rank's check returned the same gen) state_disk opens that file as it is, and its sessions
-  // are spilled ones; either way the index is removed, so that a crash from then on starts clean. A
-  // block of a kept session that comes back different from what went out stops the process.
-  uint64_t state_kept_check(const std::string& base, uint64_t run_id, double max_age_s, size_t* bytes, std::string* why);
+  // the store evicts is then spilled to it: its copy first (state_copy), then its blocks released. A
+  // spilled session comes back (state_unspill, or an operation that needs its blocks) as far as the
+  // store has room, each block checked against the checksum it went out with. When the file is full, the
+  // least recently used session with a copy is dropped (state_evicted).
+  // Durable copies (TS2, docs/engine.md "The disk tier"): every finished turn's session is written
+  // through to a complete copy in the file, named by one index file per session per rank, base.d/<h>.<seq>.c
+  // (state_copy; the server does this at each request's end). A crash, a watchdog restart or a power cut
+  // loses at most the turn in flight, and the next start reads the index files back:
+  //   - state_recover_begin(base, run_id) makes base.d and returns the spill file's size when one of its
+  //     index files is of this run and this rank, else 0 (main.cpp's allgather decides whether to reuse);
+  //   - state_recover_scan(max_age_s) reads and checks every index file, removing what fails, and
+  //     returns the (h, seq) pairs that are left (main.cpp intersects them across the ranks);
+  //   - state_recover_take(keep) installs those copies as spilled sessions and removes every other index
+  //     file; state_recover_clean() removes the spill file, the index files and the legacy index.
+  size_t state_recover_begin(const std::string& base, uint64_t run_id);
+  std::vector<std::pair<int, uint64_t>> state_recover_scan(double max_age_s);
+  void state_recover_take(const std::vector<std::pair<int, uint64_t>>& keep);
+  void state_recover_clean();
   void state_disk(const std::string& base, size_t bytes, size_t staging, bool reuse = false, uint64_t run_id = 0);
-  void state_keep(uint64_t gen);
-  uint64_t state_kept() const;              // the gen whose sessions this run's store holds (0: none)
+  void state_copy(int h);   // session h's state written through to a complete copy (its index file)
+  void state_inval(int h, int q);  // what h holds from q on is about to be rewritten
+  void state_sync();               // every copy in the file and on the disk (a planned stop)
   std::vector<int> state_sessions() const;  // the sessions in the store
   size_t state_disk_capacity() const;
   size_t state_disk_bytes() const;  // the file's bytes in spilled sessions
   std::string state_disk_path() const;
+  uint64_t state_run_id() const;  // what the copies' state depends on (main.cpp run_id; 0: none)
   void state_spill(int h);    // session h's state to the disk tier (freed without one: state_evicted)
   void state_unspill(int h);  // and back
   struct StateInfo {
@@ -310,9 +345,11 @@ class Model {
     size_t bytes = 0;        // in the store's device pool
     bool on_disk = false;    // spilled: its blocks are in the disk tier (disk_bytes), none in the pool
     size_t disk_bytes = 0;
+    uint64_t copy_seq = 0;   // the session's last complete copy in the disk tier (0: none)
   };
   StateInfo state_info(int h) const;
   size_t state_bytes() const;                  // device memory the store holds
+  StoreStats state_stats() const;              // the store's counters (`--stats-file`)
   // Wait for everything queued.
   void drain();
 

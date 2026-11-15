@@ -31,8 +31,7 @@ struct SArgs {
   const float* w;
   const int* pos;
   int rows, ratio, rows_per_cta;
-  const uint8_t* k;
-  const uint32_t* ksc;
+  attn::IndexKeys ik;  // the keys and their scales: the contiguous caches, or the shared pool's pages
   uint16_t* keys;
   int keys_stride;
   uint16_t* bkeys;
@@ -60,7 +59,8 @@ struct SSmem {
   int len[2][kSRows];
 };
 
-template <bool POOL>
+// kPaged: the keys and their scales are the shared pool's pages (a.ik.pages), not a.ik.k/sc.
+template <bool POOL, bool kPaged>
 __global__ void __launch_bounds__(kSThreads) score_p_kernel(SArgs a) {
   __shared__ __align__(16) SSmem sm;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
@@ -91,12 +91,12 @@ __global__ void __launch_bounds__(kSThreads) score_p_kernel(SArgs a) {
     k0[j] = k1[j] = make_uint4(0, 0, 0, 0);
     uint32_t s0 = 0x7f7f7f7fu, s1 = 0x7f7f7f7fu;
     if (p0 < n) {
-      k0[j] = __ldg(reinterpret_cast<const uint4*>(a.k + (size_t)p0 * 64) + t);
-      s0 = __ldg(a.ksc + p0);
+      k0[j] = __ldg(reinterpret_cast<const uint4*>(a.ik.k_at<kPaged>(p0)) + t);
+      s0 = __ldg(reinterpret_cast<const uint32_t*>(a.ik.sc_at<kPaged>(p0)));
     }
     if (p1 < n) {
-      k1[j] = __ldg(reinterpret_cast<const uint4*>(a.k + (size_t)p1 * 64) + t);
-      s1 = __ldg(a.ksc + p1);
+      k1[j] = __ldg(reinterpret_cast<const uint4*>(a.ik.k_at<kPaged>(p1)) + t);
+      s1 = __ldg(reinterpret_cast<const uint32_t*>(a.ik.sc_at<kPaged>(p1)));
     }
     sa[j] = (t & 1) ? s1 : s0;  // a lane supplies the scales of MMA row g + 8(t&1)
   }
@@ -208,13 +208,17 @@ void index_score_p(const attn::IndexQ& q, const int* pos, int rows, int ratio, a
   const int rchunks = (rows + kSRows - 1) / kSRows;
   const int ysplit = std::min(rchunks, std::max(1, (8 * nsm + nblk - 1) / nblk));
   const int rows_per_cta = (rchunks + ysplit - 1) / ysplit * kSRows;
-  SArgs a{q.q, q.sc, q.w, pos, rows, ratio, rows_per_cta, ik.k, reinterpret_cast<const uint32_t*>(ik.sc),
-          keys, keys_stride, bkeys, bkeys_stride};
+  SArgs a{q.q, q.sc, q.w, pos, rows, ratio, rows_per_cta, ik, keys, keys_stride, bkeys, bkeys_stride};
   dim3 grid(nblk, (rows + rows_per_cta - 1) / rows_per_cta);
-  if (bkeys)
-    score_p_kernel<true><<<grid, kSThreads, 0, s>>>(a);
+  const bool pg = ik.pages.paged();
+  if (bkeys && pg)
+    score_p_kernel<true, true><<<grid, kSThreads, 0, s>>>(a);
+  else if (bkeys)
+    score_p_kernel<true, false><<<grid, kSThreads, 0, s>>>(a);
+  else if (pg)
+    score_p_kernel<false, true><<<grid, kSThreads, 0, s>>>(a);
   else
-    score_p_kernel<false><<<grid, kSThreads, 0, s>>>(a);
+    score_p_kernel<false, false><<<grid, kSThreads, 0, s>>>(a);
   CUDA_CHECK(cudaGetLastError());
 }
 

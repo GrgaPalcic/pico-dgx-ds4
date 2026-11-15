@@ -868,7 +868,7 @@ static void bench_prefill() {
 // floor is the touched experts' bytes (this rank's slices, scales included) at 235 GB/s: up w1 + w3,
 // down w2; the MoE's adds the shared expert's 8.9 MB. GB/s: those bytes over the time; "sum": the MoE's
 // time summed over the case's layers. PF_TURNS="<dir>/a<pos>.m<M> ..." adds a case for each pass the
-// engine dumped (DSGB10_ROUTE_DUMP in profiling builds: <prefix>.L<LL>.i32, the layers found); PF_ROUTES
+// engine dumped (DSGB10_PREFILL_ROUTE_DUMP: <prefix>.L<LL>.i32, the layers found); PF_ROUTES
 // may then be unset. The scales are random (120..127) unless PF_SCALES=<layer> takes that layer's real
 // ones (all 384 experts, from MS_FILE or rank 0's file) for every layer. Variants: PF_DGRP="0 5 10" the
 // down kernel by these column blocks per CTA (PrefillTuning::dgrp, 0: k_moe_down_p; PF_DRING its weight

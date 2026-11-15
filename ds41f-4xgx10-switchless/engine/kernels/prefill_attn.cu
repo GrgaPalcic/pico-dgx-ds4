@@ -74,6 +74,8 @@ struct PArgs {
 // block b of row r into stage st: b < 2 the window (positions pos-127+64b+k from win_lo on), else topk
 // entries 64(b-2)+k.
 // Invalid keys are zero-filled (their scores are masked; zero codes keep P*V finite).
+// kPaged: the compressed entries are the shared pool's pages (a.ckv.pages), not a.ckv.kv/sc.
+template <bool kPaged>
 __device__ __forceinline__ void issue_block(const PArgs& a, uint8_t* sm, int p, int b, int st) {
   const int tid = threadIdx.x;
   uint8_t* cod = sm + kOffCode + st * kCodeB;
@@ -102,9 +104,9 @@ __device__ __forceinline__ void issue_block(const PArgs& a, uint8_t* sm, int p, 
     for (int it = 0; it < 4; ++it) {
       const int k = (tid >> 4) + 16 * it, kp = kps[it];
       const bool ok = kp >= 0;
-      const size_t e = ok ? (size_t)kp : 0;
-      pa::cp16(cod + k * 512 + swz(k, c) * 16, a.ckv.kv + e * (kHead / 2) + c * 16, ok);
-      if (c < 2) pa::cp16(scl + k * 32 + c * 16, a.ckv.sc + e * 32 + c * 16, ok);
+      const int e = ok ? kp : 0;
+      pa::cp16(cod + k * 512 + swz(k, c) * 16, a.ckv.kv_at<kPaged>(e) + c * 16, ok);
+      if (c < 2) pa::cp16(scl + k * 32 + c * 16, a.ckv.sc_at<kPaged>(e) + c * 16, ok);
       if (c == 0) val[k] = ok;
     }
   }
@@ -266,6 +268,7 @@ __device__ __forceinline__ uint32_t finish_pair(float x0, float x1, int d, const
   return pack_bf16(x0, x1);
 }
 
+template <bool kPaged>
 __global__ void __launch_bounds__(kThreads, 1) attn_p_kernel(PArgs a) {
   extern __shared__ __align__(16) uint8_t sm[];
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, kg = w >> 1, dg = w & 1, g = lane >> 2, t = lane & 3;
@@ -281,7 +284,7 @@ __global__ void __launch_bounds__(kThreads, 1) attn_p_kernel(PArgs a) {
   // need them before their row starts)
   int p_cur = __ldg(a.pos + blockIdx.x), p_nxt = (int)blockIdx.x + G < a.rows ? __ldg(a.pos + blockIdx.x + G) : 0;
   issue_q(a, sm, blockIdx.x, p_cur, 0);
-  issue_block(a, sm, p_cur, 0, 0);
+  issue_block<kPaged>(a, sm, p_cur, 0, 0);
   pa::cp_commit();
 
   uint32_t qa[16][4];
@@ -305,7 +308,7 @@ __global__ void __launch_bounds__(kThreads, 1) attn_p_kernel(PArgs a) {
     }
     // prefetch the next block; with block 0 this row's topk (first read by block 1's prefetch), with
     // block 1 the next row's q (this row's was read at block 0)
-    if (it + 1 < nitems) issue_block(a, sm, b + 1 < a.nb ? p_cur : p_nxt, b + 1 < a.nb ? b + 1 : 0, st ^ 1);
+    if (it + 1 < nitems) issue_block<kPaged>(a, sm, b + 1 < a.nb ? p_cur : p_nxt, b + 1 < a.nb ? b + 1 : 0, st ^ 1);
     if (b == 0 && a.kmax > 0) issue_tk(a, sm, r);
     if (b == 1 && r + G < a.rows) issue_q(a, sm, r + G, p_nxt, (ri + 1) & 1);
     pa::cp_commit();
@@ -444,7 +447,8 @@ void sparse_attn_p(const uint16_t* q_pre, const int* pos, int rows, const float2
     int d, n;
     CUDA_CHECK(cudaGetDevice(&d));
     CUDA_CHECK(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, d));
-    CUDA_CHECK(cudaFuncSetAttribute(attn_p_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+    CUDA_CHECK(cudaFuncSetAttribute(attn_p_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+    CUDA_CHECK(cudaFuncSetAttribute(attn_p_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
     return n;
   }();
   if (kmax % kBlk || kmax > kMaxK || (kmax > 0 && !topk) || win_lo < 0) die("sparse_attn_p: kmax %d", kmax);
@@ -463,7 +467,10 @@ void sparse_attn_p(const uint16_t* q_pre, const int* pos, int rows, const float2
   a.sink = sink;
   a.scale = (float)std::pow(512.0, -0.5);
   a.out = out;
-  attn_p_kernel<<<std::min(rows, nsm), kThreads, kSmem, s>>>(a);
+  if (ckv.pages.paged())
+    attn_p_kernel<true><<<std::min(rows, nsm), kThreads, kSmem, s>>>(a);
+  else
+    attn_p_kernel<false><<<std::min(rows, nsm), kThreads, kSmem, s>>>(a);
   CUDA_CHECK(cudaGetLastError());
 }
 

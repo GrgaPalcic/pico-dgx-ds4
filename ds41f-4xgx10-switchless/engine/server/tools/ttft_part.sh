@@ -5,7 +5,7 @@
 # Engine args go after --mode serve --max-ctx 262144 (production's), e.g. --profile-from-req 1 for nsys.
 # Env: WRAP / WRAP_RANK as run4.sh takes them (nsys on that rank; a worker's report, NSYS_REMOTE on that box,
 # is fetched into OUTDIR once its nsys has finished), ROUTES (a directory: rank 0 dumps every pass's routes
-# there, a build with -DDSGB10_NVTX), TURNS_ARGS (ttft_turns.py's), TIMEOUT (run4.sh's, 900).
+# there), TURNS_ARGS (ttft_turns.py's), TIMEOUT (run4.sh's, 900).
 # Out, in OUTDIR: srv_LABEL.log (rank 0's log), turns_LABEL.log (the driver's rows); progress lines in
 # OUTDIR/parts.log.
 set -u
@@ -29,7 +29,7 @@ say() { echo "$(date '+%F %T') $LABEL: $*" >> "$P"; }
 }
 say "start: $(sha256sum "$BIN" | cut -c1-16) ${WRAP:+(WRAP rank ${WRAP_RANK:-0})}${ROUTES:+(routes to $ROUTES)} $*"
 EV=()
-[ -n "${ROUTES:-}" ] && mkdir -p "$ROUTES" && EV=(DSGB10_ROUTE_DUMP="$ROUTES")
+[ -n "${ROUTES:-}" ] && mkdir -p "$ROUTES" && EV=(DSGB10_PREFILL_ROUTE_DUMP="$ROUTES")
 env "${EV[@]}" BIN="$BIN" TIMEOUT="${TIMEOUT:-900}" "$SV/run4.sh" --mode serve --max-ctx 262144 "$@" > "$L" 2>&1 < /dev/null &
 SP=$!
 for _ in $(seq 300); do

@@ -9,6 +9,9 @@ line, so that the front-end finds no session to continue, gives the cold prefill
 
 Run it against a server whose store keeps little (e.g. --session-gib 0.5) so that one session pushes the
 other out; rank 0's log says where each revisit came from ("back from disk", "reused N (end)").
+
+With `--shared-kv` (docs/shared-kv.md §3) it is the same run: a stored session takes its slot by
+pointing a table at its pages, so a revisit copies no cache, and the answers must be the flag-off run's.
 """
 import argparse
 import http.client

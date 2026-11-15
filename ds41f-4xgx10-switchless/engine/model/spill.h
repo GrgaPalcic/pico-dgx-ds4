@@ -6,14 +6,19 @@
 // Offsets and sizes are multiples of 64 KiB (the store's grain), so the file is opened O_DIRECT and
 // the page cache stays out of it. Each block's checksum, taken on the device before it goes out and
 // after it comes back (state.cu), lives in pinned memory by its offset. The writer thread logs each
-// flush's time on the stream (checksums, copies to staging) and in the file. A planned stop keeps the
-// file for the next start (state.cu, "kept sessions"): its sessions' blocks stay where they are, and the
-// next run opens it as it is.
+// flush's time on the stream (checksums, copies to staging) and in the file.
+//
+// The queue carries two kinds of job: a block's data (a copy from staging at an offset) and, after it,
+// the small index file that names the blocks of one session's copy (spill.cpp's `index`, a
+// `fdatasync` of the file then keepfile.h's atomic write). Jobs stay in queue order, so an index is
+// only ever written after the blocks it names are on the disk, and a crash leaves an index that names
+// what is there (state.cu's settle). The file stays at exit (keep): the copies in it outlive the run.
 #pragma once
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -28,9 +33,9 @@ namespace model::detail {
 class SpillFile {
  public:
   // <base>.spill of `bytes`, with `staging` bytes of pinned memory for writes in flight; its directory
-  // made (mode 0700: kept sessions are conversations). An earlier run's file is removed first, unless
-  // `reuse`: then it is opened as it is (checked before: state.cu kept_check). Dies when the directory or
-  // the file cannot be made.
+  // made (mode 0700: the copies are conversations). An earlier run's file is removed first, unless
+  // `reuse`: then it is opened as it is (checked before: state.cu state_recover). Dies when the
+  // directory or the file cannot be made.
   SpillFile(const std::string& base, size_t bytes, size_t staging, bool reuse);
   // Waits for the writes in flight, then removes the file (unless keep()).
   ~SpillFile();
@@ -44,11 +49,19 @@ class SpillFile {
   void begin(cudaStream_t st);
   // Hands the writes since the last flush to the writer (they wait for one event recorded on st now).
   void flush(cudaStream_t st);
+  // Session `copy`'s index file, written after every job queued so far: the writer waits for this
+  // copy's checksums and copies (the event it records on st now), fdatasyncs the file, and writes the
+  // index, so the index never names a block that is not on the disk. `make` fills the file's bytes on
+  // the writer's thread, once the checksums it reads are in. DSGB10_COPY_FAULT=N (test only): the
+  // process exits before writing the index of copy N, as a crash between data and index does.
+  void index(std::string path, uint64_t copy, cudaStream_t st, std::function<void(std::vector<uint8_t>&)> make);
+  // Until every queued data and index job is done (the staging buffer is then empty).
+  void drain();
   // Until write `seq` is in the file.
   void wait(uint64_t seq);
-  // Every write so far in the file and on the disk (fdatasync): before a planned stop's index.
+  // Every write so far in the file and on the disk (fdatasync).
   void sync();
-  // The file stays when this is destroyed: a planned stop kept sessions in it.
+  // The file stays when this is destroyed: copies name blocks in it.
   void keep() { keep_ = true; }
   // `bytes` of the file at `off` to device memory at dst, queued on st (the read itself is done when
   // this returns; its buffer is read again only after the copy).
@@ -66,9 +79,12 @@ class SpillFile {
     uint64_t seq;
     size_t at, off, n;  // staging offset, file offset, bytes
     cudaEvent_t ev;
-    bool last;  // the last job waiting for ev (it destroys it, and logs the flush)
+    bool last;  // the last data job waiting for ev (it destroys it, and logs the flush)
     cudaEvent_t pre = nullptr, start = nullptr;  // the last job's: begin() and the first copy
     size_t batch = 0;                            // the last job's: the flush's bytes
+    std::string path;  // an index job's file (empty: a data job)
+    std::function<void(std::vector<uint8_t>&)> make;  // and how its bytes are built (on the writer)
+    uint64_t copy = 0;                                // the copy it belongs to (DSGB10_COPY_FAULT)
   };
   void writer();
 

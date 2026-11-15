@@ -21,15 +21,34 @@ decode: untouched (no flag, no branch, same graphs)
   the span, delimiters included (the learned vectors). One shim: the reference calls
   `scaled_dot_product_attention` on 3D strided views, which only PyTorch's MATH backend accepts (42 ms per layer at
   3.8k patches on GB10); the shim passes contiguous 4D views and gets the flash kernel (0.65 ms), same values to
-  bf16 rounding. http(s) URLs are fetched with a size cap and only from public addresses (no SSRF into the LAN).
+  bf16 rounding. http(s) URLs are fetched with a size cap and only from public addresses (no SSRF into the LAN);
+  with `--no-fetch` they are refused instead (production: the images arrive inline as `data:` URLs only, so the
+  encoder makes no outbound request at all). Its log carries no request data: no image sizes, URLs or exception
+  text (a failure logs the exception's class name only, and the message still goes back to the client as the 400).
+- **Encoder rows cache** (`--cache-mib`, default 1024 MiB, `0` turns it off): the encoder keeps the span rows it
+  has already computed, keyed by the full 32-byte sha256 of the image's raw bytes, in an LRU whose stored rows
+  are capped at that many MiB (an entry larger than the cap is not stored). Every turn of a conversation resends
+  all its images, so a follow-up turn's images hit: the encoder still fetches and hashes the bytes, but skips the
+  ViT and the aligner and replies with the stored rows, `"ms": 0.0` and `"cached": true`, which saves the
+  100-160 ms per image the ViT would take. A miss encodes as before, stores the rows and replies as before (no
+  `cached` field), so with `--cache-mib 0` no reply changes.
 - **dsfront**: with `--vision-addr HOST:PORT`, `image_url` and `image` parts are accepted (without it they are
   refused as before). The chat encoding already wrote one placeholder per image (encoding.py's rules). An image
-  request gets a session of its own that is not kept and never enters the text session table, so text prefix reuse
-  is unaffected (and image turns are not prefix-cached; v1).
+  turn is planned like a text one: its session key carries each image's byte, its row count and the encoder's
+  hash, so a follow-up turn with the same images at the same places reuses the prefix like a text turn, and a
+  turn whose images differ or sit elsewhere is cut back to the first one that changed (two different images can
+  share every token id, so the hash is part of the key). A cut never falls inside a span: the ids of one image
+  all share the placeholder's end. Its session is kept and saved like a text session's.
+- **Images per request**: dsfront (`vision.rs`, `MAX_IMAGES = 16`) and the encoder (`--max-images`) both cap one
+  request at 16 images, and dsfront counts the images of the whole message history, not only the new turn
+  (server.rs): a conversation that has grown past 16 images is refused with a 400. Clients must drop old images
+  themselves; the server never drops them silently, which would change the prompt and lose the prefix reuse.
 - **Protocol**: `SubmitFlags::kFlagImages = 8`; after `prompt[]`: `u32 n`, `ImageSpan {u32 start, u32 rows,
   u64 hash}[n]`, then the rows. A text SUBMIT is byte-identical to before.
 - **Engine**: rank 0 checks that every span covers image ids only, broadcasts the spans and rows (`kCmdImages`,
-  ~25-45 ms for 200-450 rows), and marks span positions -1 in the Engram history. The prefill chunk embeds as
+  ~25-45 ms for 200-450 rows; ~50 ms per image of ~200 rows), and marks span positions -1 in the Engram history.
+  Only the spans that end after the run's first computed position go out: a follow-up turn that resends the
+  conversation's images and restarts after them ships no rows. The prefill chunk embeds as
   before, then overwrites the span rows; the MoE router reruns `router_topk` with `bias_vl` on span rows only
   (model.py `Gate`); Engram's value contribution is zeroed on span rows and their n-grams are dead
   (model.py `token_mask`), via the existing `live` rule in `hash_positions` (a negative id is dead). Span rows always
@@ -78,25 +97,35 @@ An image costs the text users what a text prompt of the same token count costs, 
 
 ## Memory
 
-Encoder on rank 0's box: 0.95 GiB of GPU memory (bf16 weights + activations), ~0.4 GiB host RSS. Rank 0's free
-device memory at ready 11.15 -> 10.31 GiB; the session store reservation (12 GiB on every rank, the smallest offer
-across ranks) and the slot layout are unchanged. Workers are untouched.
+Encoder on rank 0's box: 0.95 GiB of GPU memory (bf16 weights + activations), ~0.4 GiB host RSS plus up to
+`--cache-mib` (1 GiB by default) of span rows. Rank 0's free device memory at ready 11.15 -> 10.31 GiB; the session
+store reservation (12 GiB on every rank, the smallest offer across ranks) and the slot layout are unchanged.
+Workers are untouched.
 
 ## Running it
 
 ```
 docker run -d --name dsgx10-vision --restart unless-stopped --gpus all --net=host --memory=6g -e VISION_PRELOAD=1 \
   -v $MODEL:/model:ro -v $PWD/tools/vision:/app:ro --entrypoint python3 <image with torch + PIL + safetensors> \
-  /app/vision_encoder.py --host 127.0.0.1 --port 18950
+  /app/vision_encoder.py --host 127.0.0.1 --port 18950 --no-fetch
 dsfront serve ... --vision-addr 127.0.0.1:18950
 ```
 
+`--no-fetch` is what production runs: an http(s) `url` (or a `source.url` without data) is answered with
+"http(s) image URLs are turned off on this server: send the image inline as a data: URL", which dsfront returns
+as a 400; `data:` URLs and inline base64 are unaffected. Without it the encoder fetches public http(s) URLs as
+before. Either way its log holds no request data. The rows cache is on by default: `--cache-mib 0` runs the
+encoder as before, without it.
+
 If the encoder is down, image requests answer 503 and text requests are unaffected. Tests: `tools/vision/imgtest.py`
-(correctness + TTFT), `tools/vision/conc_img.py` (8 users + one image / text control).
+(correctness + TTFT; `NO_FETCH=1` expects the http URL to be refused and `PREFIX=1` adds three prefix-reuse cases:
+the second turn on one image, a different image, and eight images whose second turn the encoder answers from its
+cache), `tools/vision/conc_img.py` (8 users + one image / text control). `tools/vision/mk_images.py OUTDIR` draws
+the test images imgtest sends (ten known-answer PNGs, `03b_count_red5.png`, and a copy of `cases.json`); it is
+Pillow-only, deterministic and needs no GPU.
 
 ## Not done (v1)
 
-- No prefix reuse for image turns (each image request prefills its whole prompt).
 - Images are encoded one at a time on one GPU; no batching across requests.
 - `input_image` (Responses API), video and audio parts are refused.
 

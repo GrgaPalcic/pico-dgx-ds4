@@ -14,8 +14,9 @@ def b64(name):
     return "data:image/%s;base64,%s" % (ext, base64.b64encode(open(os.path.join(DIR, name), "rb").read()).decode())
 
 
-def chat(content, max_tokens=80, stream=True):
-    body = {"model": MODEL, "messages": [{"role": "user", "content": content}], "max_tokens": max_tokens,
+def chat(content, max_tokens=80, stream=True, history=None):
+    body = {"model": MODEL, "messages": list(history or []) + [{"role": "user", "content": content}],
+            "max_tokens": max_tokens,
             "temperature": 0.0, "stream": stream, "stream_options": {"include_usage": True},
             "chat_template_kwargs": {"thinking": False}}
     r = urllib.request.Request(URL, json.dumps(body).encode(), {"Content-Type": "application/json", "Authorization": "Bearer " + KEY})
@@ -37,10 +38,12 @@ def chat(content, max_tokens=80, stream=True):
                         first = time.time()
                     text += s
     except urllib.error.HTTPError as e:
-        return {"error": "HTTP %d %s" % (e.code, e.read()[:300].decode(errors="replace")), "ttft": None, "text": ""}
+        return {"error": "HTTP %d %s" % (e.code, e.read()[:300].decode(errors="replace")), "ttft": None, "text": "",
+                "cached": 0}
     t1 = time.time()
     return {"ttft": round((first or t1) - t0, 3), "total": round(t1 - t0, 3), "text": text.strip(),
-            "prompt_tokens": (usage or {}).get("prompt_tokens")}
+            "prompt_tokens": (usage or {}).get("prompt_tokens"),
+            "cached": ((usage or {}).get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0}
 
 
 def ok(text, want):
@@ -79,10 +82,14 @@ r = {"case": "long_text+image", "answer": lt.get("text"), "ok": ok(lt.get("text"
      "prompt_tokens": lt.get("prompt_tokens"), "error": lt.get("error")}
 print(json.dumps(r), flush=True); res.append(r)
 
-# http(s) URL image (fetched by the encoder)
+# http(s) URL image: fetched by the encoder, or refused when the encoder runs with --no-fetch
 h = chat([{"type": "image_url", "image_url": {"url": HTTP_IMG}}, {"type": "text", "text": "What objects are shown in this image? Answer in a few words."}])
-r = {"case": "http_url", "url": HTTP_IMG, "answer": h.get("text"), "ok": ok(h.get("text", ""), [["dice", "die"]]), "ttft": h.get("ttft"),
-     "prompt_tokens": h.get("prompt_tokens"), "error": h.get("error")}
+if os.environ.get("NO_FETCH", "0") == "1":
+    r = {"case": "http_url_refused", "url": HTTP_IMG, "answer": h.get("error") or h.get("text"),
+         "ok": "400" in str(h.get("error")) or "'code': 400" in str(h.get("text")), "ttft": None}
+else:
+    r = {"case": "http_url", "url": HTTP_IMG, "answer": h.get("text"), "ok": ok(h.get("text", ""), [["dice", "die"]]), "ttft": h.get("ttft"),
+         "prompt_tokens": h.get("prompt_tokens"), "error": h.get("error")}
 print(json.dumps(r), flush=True); res.append(r)
 
 # a bad image must be a 400, not a crash
@@ -93,5 +100,37 @@ print(json.dumps(r), flush=True); res.append(r)
 t = chat([{"type": "text", "text": "What is 17*23? Just the number."}], 10)
 r = {"case": "text_after_images", "answer": t.get("text"), "ok": "391" in t.get("text", ""), "ttft": t.get("ttft")}
 print(json.dumps(r), flush=True); res.append(r)
+
+# prefix reuse: the second turn on the same image is cached, a different image is not
+if os.environ.get("PREFIX", "0") == "1":
+    q3 = next(q for n, q, _ in cases if n == "03_count_red.png")
+    c3 = [{"type": "image_url", "image_url": {"url": b64("03_count_red.png")}}, {"type": "text", "text": q3}]
+    turn1 = chat(c3)
+    turn2 = chat("Now answer again, with just the number.",
+                 history=[{"role": "user", "content": c3}, {"role": "assistant", "content": turn1.get("text") or ""}])
+    r = {"case": "turn2_cached", "answer": turn2.get("text"), "cached": turn2.get("cached"), "prompt_tokens": turn2.get("prompt_tokens"),
+         "ttft": turn2.get("ttft"), "error": turn2.get("error"),
+         "ok": ok(turn2.get("text", ""), ["7"]) and (turn2.get("cached") or 0) >= (turn1.get("prompt_tokens") or 0) - 16}
+    print(json.dumps(r), flush=True); res.append(r)
+    other = chat([{"type": "image_url", "image_url": {"url": b64("03b_count_red5.png")}}, {"type": "text", "text": q3}])
+    r = {"case": "other_image_not_cached", "answer": other.get("text"), "cached": other.get("cached"), "prompt_tokens": other.get("prompt_tokens"),
+         "ttft": other.get("ttft"), "error": other.get("error"),
+         "ok": ok(other.get("text", ""), ["5"]) and (other.get("cached") or 0) < (turn1.get("prompt_tokens") or 0) / 2}
+    print(json.dumps(r), flush=True); res.append(r)
+
+    # eight images in one turn, then the same turn again: the second turn resends all eight, and the encoder's
+    # rows cache must answer them from memory, so its TTFT drops well under half of the first turn's
+    eight = [{"type": "image_url", "image_url": {"url": b64(n)}} for n, _, _ in cases[:8]]
+    q1 = eight + [{"type": "text", "text": "How many images are there? Answer with a number."}]
+    m1 = chat(q1)
+    m2 = chat([{"type": "text", "text": "Answer again, with just the number."}],
+              history=[{"role": "user", "content": q1}, {"role": "assistant", "content": m1.get("text") or ""}])
+    r = {"case": "many_cached", "answer": m2.get("text"), "prompt_tokens": m2.get("prompt_tokens"), "cached": m2.get("cached"),
+         "ttft": m2.get("ttft"), "turn1": {"prompt_tokens": m1.get("prompt_tokens"), "cached": m1.get("cached"),
+                                           "ttft": m1.get("ttft"), "answer": m1.get("text"), "error": m1.get("error")},
+         "error": m2.get("error")}
+    r["ok"] = ("8" in (m2.get("text") or "") and (m2.get("cached") or 0) >= (m1.get("prompt_tokens") or 0) - 16
+               and None not in (m1.get("ttft"), m2.get("ttft")) and m2["ttft"] < 0.5 * m1["ttft"])
+    print(json.dumps(r), flush=True); res.append(r)
 json.dump(res, open(OUT, "w"), indent=1)
 print("PASS %d/%d" % (sum(1 for x in res if x["ok"]), len(res)))

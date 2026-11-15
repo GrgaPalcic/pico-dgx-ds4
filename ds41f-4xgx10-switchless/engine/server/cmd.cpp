@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <string>
 
@@ -25,6 +26,23 @@ std::vector<double> g_t_wait, g_t_late, g_t_launch;
 
 double now_s() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// CLOCK_REALTIME in ns: the step and submit logs' "t", comparable across ranks and boxes
+uint64_t now_ns() {
+  timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+// DSGB10_STEP_LOG=FILE (DIAGNOSTICS, measurement only): one JSON line per step, one opening for the
+// process (spec_loop, batch_loop and spec_batch_loop share it)
+static FILE* step_log() {
+  static FILE* const f = [] {
+    const char* v = getenv("DSGB10_STEP_LOG");
+    return v && *v ? std::fopen(v, "a") : (FILE*)nullptr;
+  }();
+  return f;
 }
 
 void pin_self(int cpu) {
@@ -67,7 +85,9 @@ void apply_state(model::Model& m, const StateOp& o) {
     case kStSnap: m.state_snap(o.h, o.a); break;
     case kStSpill: m.state_spill(o.h); break;
     case kStUnspill: m.state_unspill(o.h); break;
-    case kStKeep: m.state_keep((uint64_t)(uint32_t)o.a | (uint64_t)(uint32_t)o.b << 32); break;
+    case kStCopy: m.state_copy(o.h); break;
+    case kStInval: m.state_inval(o.h, o.a); break;
+    case kStSync: m.state_sync(); break;
     default: die("state: unknown operation %d", o.op);
   }
 }
@@ -84,6 +104,11 @@ void apply_ops(model::Model& m, const Cmd& c) {
     if (h > 0) pin.push_back(h);
   m.state_pin(pin);
   for (int i = 0; i < c.n_ops; ++i) apply_state(m, c.ops[i]);
+  // --shared-kv (docs/shared-kv.md §2.6): the slots' rows are their sessions' page lists, after the
+  // state operations (a take's load, a fork's copy-on-write); a command acting on a slot that holds no
+  // session (persist_slot's free) lets it go. state_slot_row is a no-op with the flag off.
+  for (int s = 0; s < model::kMaxSlots; ++s)
+    if (c.live[s] > 0 || s == c.slot) m.state_slot_row(s, c.live[s]);
 }
 
 Cmd bcast(comm::Ring& ring, const Cmd& mine) {
@@ -115,7 +140,14 @@ model::Ctl to_ctl(const Cmd& c) {
   return t;
 }
 
-uint64_t run_prefill(model::Model& m, const Cmd& c) {
+uint64_t run_prefill(model::Model& m, const Cmd& c, bool* pool) {
+  if (pool) *pool = false;
+  // --shared-kv: the chunk's pages, allocated before it is launched (docs/shared-kv.md §2.5); false: the
+  // pool has no room and nothing to evict, and the chunk is not launched (every rank alike).
+  if (!m.shared_kv_room(m.slot(), c.pos0 + c.rows)) {
+    if (pool) *pool = true;
+    return ~0ull;
+  }
   const std::vector<int> snaps(c.snaps, c.snaps + c.n_snaps);
   const uint64_t n =
       m.prefill(c.pos0, c.rows, (c.flags & kPfSample) ? &c.sp : nullptr, c.handle, snaps, (c.flags & kPfCed) != 0);
@@ -123,7 +155,14 @@ uint64_t run_prefill(model::Model& m, const Cmd& c) {
   return n;
 }
 
-uint64_t run_rows(model::Model& m, const Cmd& c) {
+uint64_t run_rows(model::Model& m, const Cmd& c, bool* pool) {
+  if (pool) *pool = false;
+  // --shared-kv: the rows' pages, allocated before the launch (docs/shared-kv.md §2.5); false: the pool
+  // has no room and nothing to evict, and the step is not launched.
+  if (!m.shared_kv_room(m.slot(), c.pos0 + c.rows)) {
+    if (pool) *pool = true;
+    return ~0ull;
+  }
   uint64_t n;
   if (m.spec()) {  // the rows go into the draft module's windows too
     model::SpecCfg sc;
@@ -194,18 +233,24 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
   static const float cf_alpha = getenv("DSGB10_CF_ALPHA") ? (float)atof(getenv("DSGB10_CF_ALPHA")) : 1.f;
   auto gate_of = [&] { return rgate ? relax_thresh : rate.thresh(c) * cf_alpha; };
   auto verify = [&](int bound) {
+    const int pb = std::min(bound, c.limit - 1);
+    // --shared-kv: a verify step's rows are the device's choice, bounded by `pb`, so the pages cover pb +
+    // kMaxSessRows positions (docs/shared-kv.md §2.5). False: the pool has no page for it.
+    if (!m.shared_kv_room(m.slot(), pb + 1 + model::kMaxSessRows)) return false;
     cfg.thresh = gate_of();
     e.gate(cfg.thresh);
-    return m.launch_verify(c.sp, cfg, std::min(bound, c.limit - 1));
+    m.launch_verify(c.sp, cfg, pb);
+    return true;
   };
   std::vector<int32_t> toks{c.tokens[0]};  // tok_0, tok_1, ...: positions pos0, pos0 + 1, ...
   int next_snap = c.snap_every > 0 ? (c.pos0 / c.snap_every + 1) * c.snap_every : INT32_MAX;
+  if (!m.shared_kv_room(m.slot(), c.pos0 + 1)) {  // no page for the first step: nothing runs
+    e.why = kEndPool;
+    return e;
+  }
   cfg.thresh = gate_of();
   e.gate(cfg.thresh);
-  static FILE* const slog = [] {
-    const char* v = getenv("DSGB10_STEP_LOG");
-    return v && *v ? std::fopen(v, "a") : (FILE*)nullptr;
-  }();
+  FILE* const slog = step_log();
   static FILE* const mhf = [&] {  // stack4 (DSGB10_MH_DUMP=DIR on the rank that holds the pinned ring): DIR/mh.bin
     const char* v = getenv("DSGB10_MH_DUMP");
     if (!v || !*v || !m.mh_dump(0)) return (FILE*)nullptr;
@@ -221,7 +266,9 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
   if (slog) std::fprintf(slog, "{\"req\":1,\"pos0\":%d,\"max_new\":%d,\"temp\":%.3f,\"n_top\":%d}\n", c.pos0, c.max_new, c.sp.temperature, c.sp.n_top);
   const uint64_t first = m.launch_spec(1, c.pos0, c.tokens, c.sp, cfg);
   int launched = 1, prev_rows = 1;
-  if (c.ahead && c.pos0 + 1 <= feed) verify(c.pos0 + 1 + kD), ++launched;
+  // a verify whose pages the pool cannot hold is simply not queued: the loop then launches the step it
+  // needs when the rows are known (below), and stops with kEndPool if that fails too
+  if (c.ahead && c.pos0 + 1 <= feed) verify(c.pos0 + 1 + kD) && ++launched;
   for (int i = 0;; ++i) {
     wd.started = now_s();
     const model::SampleOut& o = m.wait(first + i);
@@ -234,7 +281,9 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
       std::fwrite(m.mh_dump(first + i), 2 * 15360, (size_t)std::max(0, std::min(o.step_rows, 8)), mhf);
     }
     if (slog) {  // stack4 (DSGB10_STEP_LOG, measurement only): every row's sample, the rejected rows' too
-      std::fprintf(slog, "{\"i\":%d,\"p\":%d,\"R\":%d,\"n\":%d,\"in\":[", i, o.pos0, o.step_rows, o.rows);
+      std::fprintf(slog, "{\"i\":%d,\"p\":%d,\"R\":%d,\"n\":%d,\"t\":%llu,\"ms\":%.3f,\"slot\":%d,\"wide\":%d,\"in\":[",
+                   i, o.pos0, o.step_rows, o.rows, (unsigned long long)now_ns(), m.gpu_ms(first + i), m.slot(),
+                   o.step_rows > model::kDecodeRows ? 1 : 0);
       for (size_t j = 0; j < slog_in.size(); ++j) std::fprintf(slog, "%s%d", j ? "," : "", slog_in[j]);
       std::fprintf(slog, "],\"out\":[");
       for (int j = 0; j < o.step_rows; ++j) std::fprintf(slog, "%s%d", j ? "," : "", o.row[j].token);
@@ -301,8 +350,7 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
     const int F = o.pos0 + o.rows - 1, H = o.pos0 + u;
     bool next_ran = false;
     if (stop && i + 1 == launched && H > F && H <= feed) {  // the step that feeds the last token
-      verify(H), ++launched;
-      m.engram_late(o.next_pos0, o.next_rows, o.next_tok);
+      if (verify(H)) ++launched, m.engram_late(o.next_pos0, o.next_rows, o.next_tok);
     }
     if (stop && i + 1 < launched) {  // the queued step still runs
       wd.started = now_s();
@@ -330,12 +378,18 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
       return e;
     }
     if (i + 1 == launched) {  // not queued ahead: the rows are known now
-      verify(o.next_pos0 + o.next_rows - 1), ++launched;
+      if (!verify(o.next_pos0 + o.next_rows - 1)) {  // no page for it: the loop stops at this boundary
+        e.fed = F + 1 - c.pos0;
+        e.last = toks[e.fed - 1];
+        e.why = kEndPool;
+        return e;
+      }
+      ++launched;
       m.engram_late(o.next_pos0, o.next_rows, o.next_tok);
     }
     // the step after it starts at most at next_pos0 + next_rows (every draft accepted)
     if (c.ahead && launched == i + 2 && o.next_pos0 + o.next_rows <= feed)
-      verify(o.next_pos0 + o.next_rows + kD), ++launched;
+      verify(o.next_pos0 + o.next_rows + kD) && ++launched;
     g_t_launch.push_back(now_s());
   }
 }
@@ -358,10 +412,22 @@ DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSampl
     e.written = c.pos0;
     return e;
   }
+  // --shared-kv: the pages of the step at `pos` (docs/shared-kv.md §2.5); false: the pool has no room
+  // and nothing to evict, so the step is not launched and the loop stops at that boundary (kEndPool).
+  auto room = [&](int pos) { return m.shared_kv_room(m.slot(), pos + 1); };
+  if (!room(c.pos0)) {  // the first step's page: nothing runs
+    e.why = kEndPool;
+    e.written = c.pos0;
+    return e;
+  }
+  bool pool = false;  // the pool had no page for a step the loop wanted next
   const int32_t from_device = -1;
   const uint64_t first = launch(c.pos0, c.tokens);
   int launched = 1;
-  if (c.ahead && may_run(1)) launch(c.pos0 + 1, &from_device), ++launched;
+  if (c.ahead && may_run(1)) {
+    if (room(c.pos0 + 1)) launch(c.pos0 + 1, &from_device), ++launched;
+    else pool = true;
+  }
   int32_t fed = c.tokens[0];
   for (int i = 0;; ++i) {
     wd.started = now_s();
@@ -374,7 +440,10 @@ DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSampl
     if (!c.ahead && i + 1 <= c.max_new && may_run(i + 1)) {  // diagnostics: launch only now
       bool stop = o.ctl != 0 || i + 1 >= c.max_new;
       for (int k = 0; k < c.n_stop; ++k) stop |= t == c.stop[k];
-      if (!stop) launch(c.pos0 + i + 1, &t), ++launched;
+      if (!stop) {
+        if (room(c.pos0 + i + 1)) launch(c.pos0 + i + 1, &t), ++launched;
+        else pool = true;
+      }
     }
     if (c.ahead && i + 1 < launched) m.engram_late(c.pos0 + i + 1, 1, &t);  // step i + 1 feeds t
     g_t_late.push_back(now_s());
@@ -383,7 +452,7 @@ DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSampl
     for (int k = 0; !stop && k < c.n_stop; ++k)
       if (t == c.stop[k]) stop = true, e.why = kEndStop;
     if (!stop && i + 1 >= c.max_new) stop = true, e.why = kEndLength;
-    if (!stop && i + 1 >= launched) stop = true, e.why = kEndContext;
+    if (!stop && i + 1 >= launched) stop = true, e.why = pool ? kEndPool : kEndContext;
     if (stop) {
       if (i + 1 < launched) {  // the queued step: its KV counts, its sample does not
         wd.started = now_s();
@@ -397,7 +466,10 @@ DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSampl
       return e;
     }
     fed = t;
-    if (c.ahead && may_run(i + 2)) launch(c.pos0 + i + 2, &from_device), ++launched;
+    if (c.ahead && may_run(i + 2)) {
+      if (room(c.pos0 + i + 2)) launch(c.pos0 + i + 2, &from_device), ++launched;
+      else pool = true;
+    }
     g_t_launch.push_back(now_s());
   }
 }
@@ -407,6 +479,7 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
   const int n = (int)e.size(), slot0 = m.slot();
   std::vector<BatchEnd> end(n);
+  FILE* const slog = step_log();  // DSGB10_STEP_LOG
   // per entry: its steps launched, its row in the last step launched, sampling (live) or with its last
   // row still queued (ending)
   std::vector<int> launched(n, 0), last_row(n, -1);
@@ -426,6 +499,12 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
     int ent[model::kMaxRows] = {};  // row r's entry
   };
   std::deque<Step> q;  // launched, not yet waited for
+  // entry k ends with why after its sample tok_{sampled}: its row in the step queued, if any, still runs
+  auto stop = [&](int k, uint32_t why) {
+    end[k].why = why;
+    if (launched[k] > end[k].sampled) ending[k] = 1;
+    else live[k] = 0, end[k].fed = launched[k];
+  };
   // the next step of every session still decoding, a row each; its window snapshot first (the ring then
   // holds pos - 128 .. pos - 1)
   auto launch = [&] {
@@ -435,6 +514,12 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
       const int j = launched[k];
       if (!live[k] || ending[k] || !may_run(k, j)) {
         last_row[k] = -1;
+        continue;
+      }
+      // --shared-kv: the row's page, allocated before the step (docs/shared-kv.md §2.5); an entry the
+      // pool cannot hold ends here (kEndPool) and is dropped from the step, the others run
+      if (!m.shared_kv_room(e[k].slot, e[k].pos0 + j + 1)) {
+        stop(k, kEndPool);
         continue;
       }
       const int r = b.R++, pos = e[k].pos0 + j;
@@ -452,12 +537,6 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
     b.nsess = s.R = b.R;
     s.id = m.launch_batch(b);
     q.push_back(s);
-  };
-  // entry k ends with why after its sample tok_{sampled}: its row in the step queued, if any, still runs
-  auto stop = [&](int k, uint32_t why) {
-    end[k].why = why;
-    if (launched[k] > end[k].sampled) ending[k] = 1;
-    else live[k] = 0, end[k].fed = launched[k];
   };
   launch();
   launch();  // queued behind the first, its tokens from the device
@@ -477,9 +556,12 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
       m.engram_late_batch(t);
     }
     g_t_late.push_back(now_s());
+    int emitted[model::kMaxRows] = {};  // per entry: its row's sample counted this step (the step log)
     for (int r = 0; r < s.R; ++r) {
       const int k = s.ent[r];
       BatchEnd& x = end[k];
+      if (slog)  // its row's sample counts unless its row is behind its end (the step log)
+        emitted[k] = !ending[k] || (x.why == kEndPause && x.sampled < e[k].max_new) ? 1 : 0;
       if (ending[k]) {  // its row behind its end: the KV counts; the sample too on a pause, within max_new
         if (x.why == kEndPause && x.sampled < e[k].max_new) {
           if (on) on(k, o, r);
@@ -496,6 +578,18 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
       else if (x.sampled >= e[k].max_new) stop(k, kEndLength);
       else if (o.ctl & kCtlPause) stop(k, kEndPause);           // one that ends here ends, not pauses
       else if (launched[k] <= x.sampled) stop(k, kEndContext);  // no room for its next step
+    }
+    if (slog) {  // DSGB10_STEP_LOG (measurement only): the step's entries, with the tokens they emitted
+      std::fprintf(slog, "{\"t\":%llu,\"ms\":%.3f,\"R\":%d,\"wide\":%d,\"ents\":[", (unsigned long long)now_ns(),
+                   m.gpu_ms(s.id), s.R, s.R > model::kDecodeRows ? 1 : 0);
+      for (int r = 0; r < s.R; ++r) {
+        const int k = s.ent[r];
+        std::fprintf(slog, "%s{\"slot\":%d,\"rows\":1,\"emitted\":%d,\"tok\":[", r ? "," : "", e[k].slot, emitted[k]);
+        if (emitted[k]) std::fprintf(slog, "%d", o.row[r].token);
+        std::fprintf(slog, "]}");
+      }
+      std::fprintf(slog, "],\"prop\":[0,0,0,0,0],\"acc\":[0,0,0,0,0]}\n");
+      std::fflush(slog);
     }
     if ((c.flags & kBatchSolo) && n > 1) {  // one session left decoding: it pauses, for the drafts
       int left = 0, k1 = -1;
@@ -548,6 +642,10 @@ std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vecto
       const int rows = std::min(G, e[k].max_new - fed[k]);
       if (rows <= 0) continue;
       if (b.R + rows > model::kMaxRows) die("batch_tf: a step of more than %d rows", model::kMaxRows);
+      // --shared-kv: the rows' pages before the step (docs/shared-kv.md §2.5), as the other loops; a row past
+      // the session's pages would read and write the zero page
+      if (!m.shared_kv_room(e[k].slot, e[k].pos0 + fed[k] + rows))
+        die("batch_tf: entry %d: the shared KV pool has no room for %d positions", k, e[k].pos0 + fed[k] + rows);
       const int s = b.nsess++;
       b.sp[s] = e[k].sp;
       for (int i = 0; i < rows; ++i) {
@@ -583,11 +681,12 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     die("spec batch: %d entries (the model takes %d)", n, m.spec_batch_entries());
   std::vector<DecodeEnd> end(n);
   SpecBatchStats stats;
+  FILE* const slog = step_log();  // DSGB10_STEP_LOG
   // per entry: the rows' bounds (spec_loop's pos_end and feed), live (not finished), ending (stopped, its
   // rows of one more step still to run: queued already (pend), or in the next step launched), the rows
   // of its next step as the last result chose them (nx), the drafts' rate, its history and snapshots
   std::vector<int> pos_end(n), feed(n), next_snap(n), F(n, 0), H(n, 0);
-  std::vector<char> live(n, 1), ending(n, 0), pend(n, 0);
+  std::vector<char> live(n, 1), ending(n, 0), pend(n, 0), dropped(n, 0);
   std::vector<SpecRate> rate(n);
   std::vector<std::vector<int32_t>> toks(n);  // tok_0, tok_1, ..: positions pos0, pos0 + 1, ..
   struct Next {
@@ -649,6 +748,23 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     m.engram_late_rows(R, t, p, sl);
     s.late = false;
   };
+  // --shared-kv: an entry whose rows the pool cannot hold ends where it stands (docs/shared-kv.md §2.5);
+  // its rows in a step already launched still run (their KV counts).
+  auto pool_end = [&](int k) {
+    end[k].why = kEndPool;
+    if (!end[k].sampled) {  // nothing of it has been waited for: none of its history is counted
+      live[k] = 0, dropped[k] = 1, end[k].fed = 0;
+      return;
+    }
+    ending[k] = 1;
+    if (!q.empty() && q.front().on[k]) {
+      pend[k] = 1;
+    } else {
+      const int kv_end = H[k] <= F[k] ? H[k] + 1 : F[k] + 1;
+      snaps(k, kv_end);
+      finish(k, kv_end);
+    }
+  };
   // A launch: the entries on (live, or ending with their rows still to run), each with the drafts' cap
   // by their count; the first step given (one row per entry), the others verify steps (the rows the step
   // before chose), bound by their rows' last position at most: queued ahead, every draft of the step
@@ -679,13 +795,24 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       b.token[k] = nx[k].tok[0], b.pos0[k] = nx[k].pos0;
       b.cfg.pos_end = std::max(b.cfg.pos_end, pos_end[k]);
       if (!b.on[k]) continue;
-      b.thresh[k] = rate[k].thresh(c);
-      end[k].gate(b.thresh[k]);
       bound = std::max(bound, ahead ? nx[k].pos0 + nx[k].rows + kD : nx[k].pos0 + nx[k].rows - 1);
       lim = std::min(lim, e[k].limit);
-      if (ending[k]) pend[k] = 1;
     }
     b.pos_bound = std::min(bound, lim - 1);
+    for (int k = 0; k < n; ++k) {
+      if (!b.on[k]) continue;
+      // --shared-kv: the entry's rows' pages, allocated before the step (docs/shared-kv.md §2.5; a verify
+      // step's rows are the device's choice, so the bound is what the loop knows); an entry the pool
+      // cannot hold ends here (kEndPool) and is dropped from the step, the others run
+      if (!m.shared_kv_room(e[k].slot, b.pos_bound + 1 + model::kMaxSessRows)) {
+        b.on[k] = s.on[k] = 0;
+        pool_end(k);
+        continue;
+      }
+      b.thresh[k] = rate[k].thresh(c);
+      end[k].gate(b.thresh[k]);
+      if (ending[k]) pend[k] = 1;
+    }
     s.id = given ? m.launch_spec_batch(b) : m.launch_verify_batch(b);
     s.late = !given;  // a given step's rows are the host's: launch_spec_batch looked them up
     q.push_back(s);
@@ -727,8 +854,15 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       stats.gpu_ms[std::min(prev_R, model::kMaxRows)] += m.gpu_ms(prev_id), ++stats.gpu_n[std::min(prev_R, model::kMaxRows)];
     prev_id = s.id, prev_R = o.step_rows;
     ++stats.steps, stats.rows += o.step_rows;
+    // the step's rows of an entry behind its end: its tokens are dropped (the step log's "emitted")
+    const std::vector<char> was_ending = slog ? ending : std::vector<char>();
+    // its tokens before this step: the ones it emits are appended to toks[k] below (the step log's "tok")
+    std::vector<size_t> tok0(slog ? (size_t)n : 0);
+    if (slog)
+      for (int k = 0; k < n; ++k) tok0[k] = toks[k].size();
     for (int k = 0; k < n; ++k) {
       if (!s.on[k]) continue;
+      if (dropped[k]) continue;  // --shared-kv: dropped before anything ran (pool_end), its rows ignored
       DecodeEnd& d = end[k];
       const int p0 = o.sess_pos0[k], sr = o.sess_step_rows[k], er = o.sess_rows[k], r0 = o.sess_row0[k];
       if (sr < 1 || er < 1 || er > sr || r0 < 0 || r0 + sr > o.step_rows)
@@ -777,6 +911,33 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
         snaps(k, kv_end);
         finish(k, kv_end);
       }
+    }
+    if (slog) {  // DSGB10_STEP_LOG (measurement only): the step's entries, with the tokens they emitted
+      // "prop"/"acc": the entries whose rows held at least d drafts, and that accepted at least d of them
+      int prop[model::ops::kDrafts] = {}, acc[model::ops::kDrafts] = {};
+      for (int k = 0; k < n; ++k) {
+        if (!s.on[k] || dropped[k] || was_ending[k]) continue;
+        for (int d = 1; d <= model::ops::kDrafts; ++d)
+          prop[d - 1] += o.sess_step_rows[k] - 1 >= d, acc[d - 1] += o.sess_rows[k] - 1 >= d;
+      }
+      std::fprintf(slog, "{\"t\":%llu,\"ms\":%.3f,\"R\":%d,\"wide\":%d,\"ents\":[", (unsigned long long)now_ns(),
+                   m.gpu_ms(s.id), o.step_rows, o.step_rows > model::kDecodeRows ? 1 : 0);
+      bool first = true;
+      for (int k = 0; k < n; ++k) {
+        if (!s.on[k] || dropped[k]) continue;
+        std::fprintf(slog, "%s{\"slot\":%d,\"rows\":%d,\"emitted\":%d,\"tok\":[", first ? "" : ",", e[k].slot,
+                     o.sess_step_rows[k], was_ending[k] ? 0 : o.sess_rows[k]);
+        for (size_t j = tok0[k]; j < toks[k].size(); ++j)
+          std::fprintf(slog, "%s%d", j == tok0[k] ? "" : ",", toks[k][j]);
+        std::fprintf(slog, "]}");
+        first = false;
+      }
+      std::fprintf(slog, "],\"prop\":[");
+      for (int d = 0; d < model::ops::kDrafts; ++d) std::fprintf(slog, "%s%d", d ? "," : "", prop[d]);
+      std::fprintf(slog, "],\"acc\":[");
+      for (int d = 0; d < model::ops::kDrafts; ++d) std::fprintf(slog, "%s%d", d ? "," : "", acc[d]);
+      std::fprintf(slog, "]}\n");
+      std::fflush(slog);
     }
     if ((c.flags & kBatchSolo) && n > 1) {  // one entry left decoding: it pauses, to go on alone
       int left = 0, k1 = -1;
@@ -861,7 +1022,8 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       wd.started = 0;
     } else if (c.op == kCmdRows) {
       wd.started = now_s();
-      m.wait(run_rows(m, c));
+      const uint64_t n = run_rows(m, c);
+      if (n != ~0ull) m.wait(n);  // ~0: the pool had no page for it and it was not launched
       wd.started = 0;
     } else if (c.op != kCmdState) {
       die("rank %d: unknown command %d", rank, c.op);

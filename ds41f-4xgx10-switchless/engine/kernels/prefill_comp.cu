@@ -30,7 +30,9 @@ struct ESmem {
 
 // CTA b scans rows [16 ratio b, 16 ratio (b + 1)) for the rows that complete a group ((pos + 1) % ratio
 // == 0) and emits their entries 16 at a time. Row r's group starts at row r - 1 (ratio 2), or in the
-// carry for r = 0, as attn::compressor_emit.
+// carry for r = 0, as attn::compressor_emit. kPaged: the entries go into the shared pool's pages
+// (ckv.pages, ik.pages), not into ckv.kv/sc and ik.k/sc.
+template <bool kPaged>
 __global__ void __launch_bounds__(kEThreads) emit_p_kernel(const float* __restrict__ kv, const float* __restrict__ score,
                                                            const int* __restrict__ pos, int rows,
                                                            attn::CompressorWeights w, attn::CompressorCarry carry,
@@ -146,8 +148,9 @@ __global__ void __launch_bounds__(kEThreads) emit_p_kernel(const float* __restri
       const float s = attn::fp4_e8m0_scale(attn::warp_max(fabsf(x)));
       const uint32_t code = attn::fp4_code(x, s);
       const uint32_t hi = __shfl_down_sync(0xffffffffu, code, 1);
-      if ((lane & 1) == 0) ik.k[(size_t)j * (kIdxDim / 2) + attn::fp4x128_byte(tid / 2)] = (uint8_t)(code | (hi << 4));
-      if (lane == 0) ik.sc[(size_t)j * 4 + warp] = attn::f_to_ue8m0(s);
+      if ((lane & 1) == 0)
+        ik.k_at_w<kPaged>(j)[attn::fp4x128_byte(tid / 2)] = (uint8_t)(code | (hi << 4));
+      if (lane == 0) ik.sc_at_w<kPaged>(j)[warp] = attn::f_to_ue8m0(s);
     }
     // KV entry: RoPE on the latent's last 64 dims at j * ratio, fp4 with an e4m3 scale per 16; thread t
     // owns channels 4t..4t+3
@@ -172,9 +175,9 @@ __global__ void __launch_bounds__(kEThreads) emit_p_kernel(const float* __restri
       const float s = attn::fp4_e4m3_scale(am);
       const uint32_t c0 = attn::fp4_code(ev[0], s), c1 = attn::fp4_code(ev[1], s), c2 = attn::fp4_code(ev[2], s),
                      c3 = attn::fp4_code(ev[3], s);
-      *reinterpret_cast<uint16_t*>(ckv.kv + (size_t)j * (kHead / 2) + 2 * tid) =
+      *reinterpret_cast<uint16_t*>(ckv.kv_at_w<kPaged>(j) + 2 * tid) =
           (uint16_t)((c0 | (c1 << 4)) | ((c2 | (c3 << 4)) << 8));
-      if ((tid & 3) == 0) ckv.sc[(size_t)j * 32 + tid / 4] = attn::f_to_e4m3(s);
+      if ((tid & 3) == 0) ckv.sc_at_w<kPaged>(j)[tid / 4] = attn::f_to_e4m3(s);
     }
     __syncthreads();
   }
@@ -204,8 +207,12 @@ void compressor_emit_p(const float* kv, const float* score, const int* pos, int 
                        attn::CompressorCarry carry, const float2* table, attn::Compressed ckv, attn::IndexKeys ik,
                        cudaStream_t s) {
   if (rows < 1 || (w.ratio != 1 && w.ratio != 2)) die("compressor_emit_p: rows %d ratio %d", rows, w.ratio);
+  if (ckv.pages.paged() != ik.pages.paged()) die("compressor_emit_p: ckv and ik pages differ");
   const int per = kEE * w.ratio;
-  emit_p_kernel<<<(rows + per - 1) / per, kEThreads, 0, s>>>(kv, score, pos, rows, w, carry, table, ckv, ik);
+  if (ckv.pages.paged())
+    emit_p_kernel<true><<<(rows + per - 1) / per, kEThreads, 0, s>>>(kv, score, pos, rows, w, carry, table, ckv, ik);
+  else
+    emit_p_kernel<false><<<(rows + per - 1) / per, kEThreads, 0, s>>>(kv, score, pos, rows, w, carry, table, ckv, ik);
   CUDA_CHECK(cudaGetLastError());
   if (w.ratio > 1) {
     carry_p_kernel<<<rows < 16 ? rows : 16, 128, 0, s>>>(kv, score, pos, rows, carry);

@@ -47,7 +47,7 @@ struct RowCache {
   void init(size_t bytes) {
     const size_t slots = bytes / kRowBytes;
     if (!slots) return;
-    data = static_cast<uint8_t*>(big_alloc(slots * kRowBytes));
+    data = static_cast<uint8_t*>(big_alloc(slots * kRowBytes, "engram-rows"));
     idx.init(slots);
   }
   ~RowCache() {
@@ -150,7 +150,7 @@ struct Store::Impl {
     ring = std::make_unique<Uring>(unsigned(2 * qd));
     ring->register_files(fds.data(), unsigned(fds.size()));
     bounce_bytes = (size_t(qd) * 2 + 1) * kWin;
-    bounce = static_cast<uint8_t*>(big_alloc(bounce_bytes));
+    bounce = static_cast<uint8_t*>(big_alloc(bounce_bytes, "engram-bounce"));
     std::memset(bounce, 0, bounce_bytes);
     iovec iov{bounce, bounce_bytes};
     ring->register_buffers(&iov, 1);

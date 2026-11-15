@@ -20,6 +20,7 @@
 #include "kernels/dsk.h"
 #include "model/model.h"
 #include "model/ops.h"
+#include "model/pages.h"
 
 namespace model {
 namespace detail {
@@ -78,8 +79,9 @@ struct KvSrc {  // a kv-source layer's compressed KV, index keys and compressor 
   uint8_t *ckv, *csc, *ik, *iksc;
   int cap;
   float *carry_kv, *carry_sc;
-  attn::Compressed compressed() const { return attn::Compressed{ckv, csc, cap}; }
-  attn::IndexKeys keys() const { return attn::IndexKeys{ik, iksc, cap}; }
+  attn::KvPages pages;  // --shared-kv: the pool's pages (null tab: the contiguous caches above)
+  attn::Compressed compressed() const { return attn::Compressed{ckv, csc, cap, nullptr, 0, 0, pages}; }
+  attn::IndexKeys keys() const { return attn::IndexKeys{ik, iksc, cap, nullptr, 0, 0, pages}; }
   // session slots: slot s's buffers are slot 0's + s strides (whole caches of cap entries; the carries' 16
   // rows of kHead floats)
   size_t ckv_stride() const { return (size_t)cap * 256; }
@@ -89,20 +91,25 @@ struct KvSrc {  // a kv-source layer's compressed KV, index keys and compressor 
   static constexpr size_t kCarryStride = 16 * kHead;  // floats
   KvSrc at(int s) const {
     KvSrc k = *this;
-    k.ckv += s * ckv_stride(), k.csc += s * csc_stride(), k.ik += s * ik_stride(), k.iksc += s * iksc_stride();
+    if (k.ckv)  // --shared-kv: no per-slot caches (the pool's pages hold them); the carries stay per slot
+      k.ckv += s * ckv_stride(), k.csc += s * csc_stride(), k.ik += s * ik_stride(), k.iksc += s * iksc_stride();
     k.carry_kv += s * kCarryStride, k.carry_sc += s * kCarryStride;
     return k;
   }
 };
 constexpr size_t kRingKvBytes = (size_t)attn::kRing * kHead, kRingScBytes = (size_t)attn::kRing * kHead / 32;
 
-// DIAGNOSTICS (model.cu k_route_copy): a step's routed experts
-constexpr int kRouteRing = 8;
+// DIAGNOSTICS (model.cu k_route_copy): a step's routed experts, and every row's top-12 router picks with
+// their selection keys (sqrtf(softplus(logit)) + bias, descending, ties to the lower id). A layer the run
+// does not cover (a bench layer range) holds -1 and NaN: it wrote nothing for this step.
+constexpr int kRouteRing = 8, kRouteTop = 12;
 struct RouteRec {
   uint32_t step;
   int32_t R;
   int32_t slot[kMaxRows], pos[kMaxRows];
   int16_t e[kLayers][kMaxRows][kTopK];
+  int16_t top_id[kLayers][kMaxRows][kRouteTop];
+  float top_sc[kLayers][kMaxRows][kRouteTop];
 };
 
 struct Prefill;  // prefill.cu's buffers
@@ -137,6 +144,12 @@ struct Model::Impl {
   int nslots = 1, cur_slot = 0;  // logical slots (the server's), the current one
   int nunits = 1, cur_unit = 0;  // physical units (config.h kUnitMul): what slot tables and strides index
   int unit_of[kMaxSlots] = {}, slot_ctx_[kMaxSlots] = {};
+  // --shared-kv (docs/shared-kv.md): the compressed caches and the index keys are the store's pool's
+  // pages, one table row per slot; a unit is a slot, so unit_of and the strides above are unchanged.
+  bool shared_kv = false;
+  int max_pages = 0;              // the slot table's entries per slot (pages.h max_pages_of)
+  uint64_t* slot_tab = nullptr;   // device: [nslots][max_pages] page base pointers, made with the model
+  detail::SlotSessions slot_sess;  // the session live in each slot (0: none; state_slot_row sets it)
   float2 *rope_plain, *rope_yarn;
   int kstride;
 
@@ -261,6 +274,20 @@ struct Model::Impl {
 
   // ---- session slots ------------------------------------------------------------------------
   void use_slot(int s);
+  // --shared-kv: the pool's zero page, the slot table and the rows (state.cu), the pages a slot's
+  // session needs (shared_kv_room) and a slot's row (state_slot_row). All no-ops with the flag off.
+  void reserve_pages(size_t bytes);
+  void state_slot_row(int s, int h);
+  void write_slot_row(int s);
+  int slot_of(int h) const;  // the slot session h is live in (-1: none)
+  int evictable(int h);      // the least recently used session h's operation may evict (-1: none)
+  // Room for the session live in slot s (dies when the slot has none), and for each row's slot.
+  bool shared_kv_room(int s, int upto);
+  bool shared_kv_room(const int* slot, const int* pos, int rows);
+  // The per-session one: session h, live in a slot or stored, up to `upto` positions.
+  bool session_room(int h, int upto);
+  // The slot table's view of kv source k: slot s's row, or every row for a step (s < 0).
+  attn::KvPages page_view(int k, int s) const;
   // A step's view of the state: with one slot, its pointers (the kernels' one-session code, no table); with
   // more, slot 0's and the step's slot table (in_d->slot), so that one captured step serves rows in any slots.
   attn::Window step_win(int L) const;
@@ -348,10 +375,21 @@ struct Model::Impl {
   detail::Store& store_of();
   void state_reserve(size_t bytes);
   uint8_t* store_alloc(int h, size_t bytes);  // a block of the pool for session h (evicting), or nullptr
+  uint8_t* cow_page(int h);  // --shared-kv: a page for session h's copy-on-write: the pool's, else the spare
   void store_release(uint8_t* p, size_t bytes);
-  uint64_t state_kept_check(const std::string& base, uint64_t run_id, double max_age_s, size_t* bytes, std::string* why);
+  // A start's copies (state.cu): the index files under base.d, one per session per rank. begin() makes
+  // the directory and returns the spill file's size when one of them is of this run (else 0); scan()
+  // reads and checks them (dropping what fails); take() installs the copies every rank agreed on; clean()
+  // removes everything.
+  size_t state_recover_begin(const std::string& base, uint64_t run_id);
+  std::vector<std::pair<int, uint64_t>> state_recover_scan(double max_age_s);
+  void state_recover_take(const std::vector<std::pair<int, uint64_t>>& keep);
+  void state_recover_clean();
   void state_disk(const std::string& base, size_t bytes, size_t staging, bool reuse, uint64_t run_id);
-  void state_keep(uint64_t gen);
+  void settle();  // the freed offsets and the index files waiting: the writes land, the files go, the blocks free
+  void state_copy(int h);   // session h's state written through to a complete copy (its index file)
+  void state_inval(int h, int q);  // what h holds from q on is about to be rewritten
+  void state_sync();               // every copy in the file and on the disk (a planned stop)
   size_t disk_take(int h, size_t bytes);  // room in the disk tier's file for session h (dropping), or kNone
   void state_spill(int h);
   void state_unspill(int h);

@@ -16,10 +16,12 @@ __device__ __forceinline__ float block_sum128(float v, float* red) {
 
 // Row r's entry, by a 128-thread CTA; rows that do not complete a group return at once. carry, ckv and ik are
 // row r's session's (attn_common.cuh carry_at etc.); prev: row r - 1 is of the same session (ratio 2: the
-// group's first position is that row's projection, else the carry's).
+// group's first position is that row's projection, else the carry's). kPaged: the entry's bytes in the pool's
+// pages (the accessors of attn.h).
+template <bool kPaged>
 __device__ __forceinline__ void emit_row(int r, bool prev, const float* kv, const float* score, const int* pos,
                                          const CompressorWeights& w, const CompressorCarry& carry,
-                                         const float2* table, const Compressed& ckv, const IndexKeys& ik,
+                                         const float2* table, Compressed ckv, IndexKeys ik,
                                          uint16_t* dbg_latent, int dbg_base) {
   __shared__ float lat[kHead];
   __shared__ float ikv[kIdxDim];
@@ -28,6 +30,18 @@ __device__ __forceinline__ void emit_row(int r, bool prev, const float* kv, cons
   int p = pos[r];
   if ((p + 1) % ratio != 0) return;
   int j = p / ratio;
+  // The entry's four caches, kPaged: each is a table load in the pool's pages, a cache's two arrays the same
+  // entry. Both loads are taken here, at the top, so their latency hides under the projections' 128 KB of
+  // weights instead of sitting on the stores' critical path at the end, and the lines the stores land on
+  // (cold in the pool; the KV entry is 256 B, two lines) are prefetched here too. Each store site below takes
+  // either the address taken here or, off the flag, its own arithmetic of before (a constant ternary).
+  uint8_t* dst_ckv = nullptr, *dst_csc = nullptr, *dst_ik = nullptr, *dst_iksc = nullptr;
+  if constexpr (kPaged) {
+    dst_ckv = ckv.kv_at_w<true>(j), dst_csc = ckv.sc_at_w<true>(j);
+    dst_ik = ik.k_at_w<true>(j), dst_iksc = ik.sc_at_w<true>(j);
+    prefetch_l2(dst_ckv), prefetch_l2(dst_ckv + 128), prefetch_l2(dst_csc);
+    prefetch_l2(dst_ik), prefetch_l2(dst_iksc);
+  }
   // pool the group (ratio 2: per-channel softmax over its two positions), round to bf16
   float v[4];
 #pragma unroll
@@ -107,8 +121,8 @@ __device__ __forceinline__ void emit_row(int r, bool prev, const float* kv, cons
     float s = fp4_e8m0_scale(warp_max(fabsf(x)));
     uint32_t code = fp4_code(x, s);
     uint32_t hi = __shfl_down_sync(0xffffffffu, code, 1);
-    if ((lane & 1) == 0) ik.k[(size_t)j * (kIdxDim / 2) + fp4x128_byte(t / 2)] = (uint8_t)(code | (hi << 4));
-    if (lane == 0) ik.sc[(size_t)j * 4 + wid] = f_to_ue8m0(s);
+    if ((lane & 1) == 0) (kPaged ? dst_ik : ik.k_at_w<false>(j))[fp4x128_byte(t / 2)] = (uint8_t)(code | (hi << 4));
+    if (lane == 0) (kPaged ? dst_iksc : ik.sc_at_w<false>(j))[wid] = f_to_ue8m0(s);
   }
   // KV entry: RoPE on the latent's last 64 dims at j*ratio, then fp4 with an e4m3 scale per 16.
   // Thread t owns channels [4t, 4t+4): four threads per 16-block, threads 112..127 hold the RoPE dims.
@@ -130,10 +144,10 @@ __device__ __forceinline__ void emit_row(int r, bool prev, const float* kv, cons
   am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 2));
   float s = fp4_e4m3_scale(am);
   uint32_t c0 = fp4_code(e[0], s), c1 = fp4_code(e[1], s), c2 = fp4_code(e[2], s), c3 = fp4_code(e[3], s);
-  uint8_t* dst = ckv.kv + (size_t)j * (kHead / 2) + 2 * t;
+  uint8_t* dst = (kPaged ? dst_ckv : ckv.kv_at_w<false>(j)) + 2 * t;
   dst[0] = (uint8_t)(c0 | (c1 << 4));
   dst[1] = (uint8_t)(c2 | (c3 << 4));
-  if ((t & 3) == 0) ckv.sc[(size_t)j * 32 + t / 4] = f_to_e4m3(s);
+  if ((t & 3) == 0) (kPaged ? dst_csc : ckv.sc_at_w<false>(j))[t / 4] = f_to_e4m3(s);
 }
 
 // ratio 2: keep row r's projections in the carry slot of its position (carry: row r's session's)

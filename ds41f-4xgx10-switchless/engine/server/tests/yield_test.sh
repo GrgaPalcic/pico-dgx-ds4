@@ -256,8 +256,10 @@ flock -n "$RING_LOCK" true && bad "the ring lock is free while the job runs" || 
 until_ 20 ended j8 && ok "the job ended by itself" || bad "the job did not end"
 "$SVC" status > /dev/null 2>&1
 [ $? = 3 ] && ok "the test service is down" || bad "status after the stop: $?"
-[ "$(stat -c %a "$T/svc/run/front.table" 2> /dev/null)" = 600 ] && ok "dsfront saved its session table, mode 600: $(grep 'session table' "$T/svc/logs/front.log" | tail -n 1)" ||
-  bad "no session table saved: $(grep 'session table' "$T/svc/logs/front.log" | tail -n 1)"
+F=$(ls "$T/svc/run/front.d/"*.t 2> /dev/null | head -n 1)
+[ "$(stat -c %a "$T/svc/run/front.d" 2> /dev/null)" = 700 ] && [ -n "$F" ] && [ "$(stat -c %a "$F")" = 600 ] &&
+  ok "dsfront's session files are on disk: $(ls "$T/svc/run/front.d" | grep -c '\.t$') in front.d (700), each 600" ||
+  bad "no session files: $(ls -la "$T/svc/run/front.d" 2> /dev/null | tr '\n' ' ')"
 
 echo "9. a ring job inside a ring job runs at once: the lock comes with it"
 "$SVC" start > "$T/start2.log" 2>&1 && until_ 30 serving || bad "the test service did not start again: $(tail -n 2 "$T/start2.log")"
@@ -267,9 +269,9 @@ until_ 30 test -s "$T/n.rc" && [ "$(cat "$T/n.rc")" = 0 ] && t=$(since "$(cat "$
   ok "the inner ring.sh ran ${t} s after the outer one got the ring" || bad "nested: $(cat "$T/n.rc" 2> /dev/null), $(tail -n 3 "$T/n.log")"
 [ "$(grep -c 'the ring is busy' "$T/n.log")" = 1 ] && ok "only the outer one waited for the ring" || bad "nested waits: $(grep -c 'the ring is busy' "$T/n.log")"
 rc_of n && until_ 30 serving && ok "back to serving" || bad "after the nested job: $(state)"
-grep -q "session table: [1-9][0-9]* sessions from" "$T/svc/logs/front.log" && [ ! -e "$T/svc/run/front.table" ] &&
-  ok "the restarted dsfront took its table back, and the file is gone: $(grep 'session table' "$T/svc/logs/front.log" | tail -n 1)" ||
-  bad "the table at the start: $(grep 'session table' "$T/svc/logs/front.log" | tail -n 1); $(ls "$T/svc/run" | tr '\n' ' ')"
+grep -q "session table: [1-9][0-9]* sessions from" "$T/svc/logs/front.log" && ls "$T/svc/run/front.d/"*.t > /dev/null 2>&1 &&
+  ok "the restarted dsfront took its sessions back, and their files stay: $(grep 'session table' "$T/svc/logs/front.log" | tail -n 1)" ||
+  bad "the table at the start: $(grep 'session table' "$T/svc/logs/front.log" | tail -n 1); $(ls "$T/svc/run/front.d" 2> /dev/null | tr '\n' ' ')"
 
 echo "10. a driver's held want keeps the ring lent between its parts; a job that waits in the gap goes first"
 until_ 30 serving
@@ -304,17 +306,17 @@ wait $kp 2> /dev/null
 until_ 6 unheld && ok "a driver killed with SIGKILL: its held want went within 6 s" ||
   bad "the killed driver's want is still there"
 
-echo "11. forget: refused while the service runs; stop --forget stops it, then removes dsfront's saved table"
-printf 'x\n' > "$T/svc/run/front.table" && chmod 600 "$T/svc/run/front.table"
+echo "11. forget: refused while the service runs; stop --forget stops it, then removes dsfront's session files"
+mkdir -p "$T/svc/run/front.d" && printf 'x\n' > "$T/svc/run/front.d/0000000000000001.t"
 "$SVC" forget > "$T/forget1.log" 2>&1
 rc=$?
-[ "$rc" = 1 ] && [ -f "$T/svc/run/front.table" ] && ok "forget while it runs: refused ($(head -n 1 "$T/forget1.log"))" ||
+[ "$rc" = 1 ] && [ -f "$T/svc/run/front.d/0000000000000001.t" ] && ok "forget while it runs: refused ($(head -n 1 "$T/forget1.log"))" ||
   bad "forget while it runs: rc $rc, $(head -n 2 "$T/forget1.log" | tr '\n' '|')"
 "$SVC" stop --forget > "$T/forget2.log" 2>&1
 rc=$?
 "$SVC" status > /dev/null 2>&1
 st=$?
-[ "$rc" = 0 ] && [ "$st" = 3 ] && [ ! -e "$T/svc/run/front.table" ] && ok "stop --forget: $(tail -n 1 "$T/forget2.log")" ||
+[ "$rc" = 0 ] && [ "$st" = 3 ] && [ ! -e "$T/svc/run/front.d" ] && ok "stop --forget: $(tail -n 1 "$T/forget2.log")" ||
   bad "stop --forget: rc $rc, status $st, $(ls "$T/svc/run" | tr '\n' ' '), $(tail -n 2 "$T/forget2.log" | tr '\n' '|')"
 
 echo "12. jobs take the ring in the order they asked for it, even when a younger one finds the lock free"

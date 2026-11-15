@@ -132,6 +132,7 @@ struct ScoreArgs {
   int bkeys_stride;
   const int* slot;    // IndexKeys' session slots (attn.h): slot s's keys from entry s * slot_entries on
   int slot_entries;  // (slot_entries below)
+  KvPages pages;     // --shared-kv: the keys in the pool's pages (off[2] = keys, off[3] = their scales)
 };
 
 // Row r's session's first key entry: an offset in entries, so that the key pointers stay kernel parameters
@@ -147,8 +148,10 @@ struct TileKeys {
   uint4 k0, k1;
   uint32_t sa;
 };
-__device__ __forceinline__ TileKeys load_tile(const ScoreArgs& a, uint32_t e0, const int* blist, int i0, int n, int lo,
-                                              int lane) {
+// `pg` is the row's table (page_ent, 2.4) and `e0` its entry offset in the contiguous path (0 through pages).
+template <bool kPaged>
+__device__ __forceinline__ TileKeys load_tile(const ScoreArgs& a, const KvPages& pg, uint32_t e0, const int* blist,
+                                              int i0, int n, int lo, int lane) {
   int g = lane >> 2, t = lane & 3;
   TileKeys k;
   if (blist) {
@@ -164,13 +167,13 @@ __device__ __forceinline__ TileKeys load_tile(const ScoreArgs& a, uint32_t e0, c
   uint32_t s0 = 0x7f7f7f7fu, s1 = 0x7f7f7f7fu;
   if (k.p0 >= 0) {  // entry e0 + p0, unsigned: one wide multiply-add per address
     const uint32_t e = e0 + k.p0;
-    k.k0 = __ldg(reinterpret_cast<const uint4*>(a.k + (size_t)e * 64) + t);
-    s0 = __ldg(a.ksc + e);
+    k.k0 = __ldg(reinterpret_cast<const uint4*>(page_ent<kPaged>(pg, a.k, e, 2, 64)) + t);
+    s0 = __ldg(reinterpret_cast<const uint32_t*>(page_ent<kPaged>(pg, reinterpret_cast<const uint8_t*>(a.ksc), e, 3, 4)));
   }
   if (k.p1 >= 0) {
     const uint32_t e = e0 + k.p1;
-    k.k1 = __ldg(reinterpret_cast<const uint4*>(a.k + (size_t)e * 64) + t);
-    s1 = __ldg(a.ksc + e);
+    k.k1 = __ldg(reinterpret_cast<const uint4*>(page_ent<kPaged>(pg, a.k, e, 2, 64)) + t);
+    s1 = __ldg(reinterpret_cast<const uint32_t*>(page_ent<kPaged>(pg, reinterpret_cast<const uint8_t*>(a.ksc), e, 3, 4)));
   }
   k.sa = (t & 1) ? s1 : s0;
   return k;
@@ -230,7 +233,7 @@ __device__ __forceinline__ void score_tile_row(const TileKeys& k, const uint8_t 
   }
 }
 
-template <int RB>
+template <bool kPaged, int RB>
 __global__ void __launch_bounds__(128) score_kernel(ScoreArgs a) {
   __shared__ __align__(16) uint8_t sq[RB][kIdxHeads][64];
   __shared__ uint32_t ssc[RB][kIdxHeads];
@@ -257,10 +260,11 @@ __global__ void __launch_bounds__(128) score_kernel(ScoreArgs a) {
   __syncthreads();
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int* blist = a.blocks ? a.blocks + (size_t)r0 * a.nblocks : nullptr;
+  const KvPages pg = kPaged ? pages_at(a.pages, r0) : KvPages{};  // one session: any row of it
   for (int tile = 0; tile < kScoreTiles; ++tile) {
     int i0 = base + (warp * kScoreTiles + tile) * 16;
     if (i0 >= n) break;
-    TileKeys k = load_tile(a, 0, blist, i0, n, lo, lane);  // one session (index_score)
+    TileKeys k = load_tile<kPaged>(a, pg, 0, blist, i0, n, lo, lane);  // one session (index_score)
     for (int rr = 0; rr < nr; ++rr)
       score_tile_row(k, sq[rr], ssc[rr], sw[rr], slen[rr], i0, lo, a.keys + (size_t)(r0 + rr) * a.keys_stride,
                      a.bkeys ? a.bkeys + (size_t)(r0 + rr) * a.bkeys_stride : nullptr, lane);
@@ -579,7 +583,7 @@ struct IndexFusedArgs {
   SelectArgs top, pool;  // pool.out_pos null: no pool
   int* counters;
 };
-template <bool kSlots>  // a slot table (ScoreArgs::slot); without one, the code of one session
+template <bool kSlots, bool kPaged>  // a slot table (ScoreArgs::slot); without one, the code of one session
 __global__ void __launch_bounds__(kSelThreads) index_fused_kernel(IndexFusedArgs a) {
   __shared__ __align__(16) uint8_t sq[kIdxHeads][64];
   __shared__ uint32_t ssc[kIdxHeads];
@@ -600,12 +604,13 @@ __global__ void __launch_bounds__(kSelThreads) index_fused_kernel(IndexFusedArgs
   int base = blockIdx.x * kFusedPos, p = s.pos[r];
   if (base < n) {
     const int* blist = s.blocks ? s.blocks + (size_t)r * s.nblocks : nullptr;
-    const uint32_t e0 = kSlots ? keys_of(s, r) : 0u;
+    const uint32_t e0 = kSlots && !kPaged ? keys_of(s, r) : 0u;
+    const KvPages pg = kPaged ? pages_at(s.pages, r) : KvPages{};
     TileKeys k[kScoreTiles];
 #pragma unroll
     for (int tile = 0; tile < kScoreTiles; ++tile) {
       int i0 = base + (warp * kScoreTiles + tile) * 16;
-      if (i0 < n) k[tile] = load_tile(s, e0, blist, i0, n, lo, lane);
+      if (i0 < n) k[tile] = load_tile<kPaged>(s, pg, e0, blist, i0, n, lo, lane);
     }
     q_prep_head(a.iq_pre + ((size_t)r * kIdxHeads + warp) * kIdxDim, a.wproj[(size_t)r * kIdxHeads + warp], p,
                 a.table, lane, sq[warp], &ssc[warp], &sw[warp], nullptr);
@@ -698,9 +703,10 @@ __device__ __forceinline__ void select_dense(const SelectArgs& a, int r, uint32_
   select_bins<true>(a, r, 0, n, top, next, cap, ckey, cidx, bmax, blist);
 }
 
-// kSlots: a slot table (ScoreArgs::slot); without one, the code of one session. kRows: kDenseRows, or
-// kMaxDecodeRows (groups of at most kDenseRows rows, each at the start of the shared memory)
-template <bool kSlots, int kRows>
+// kSlots: a slot table (ScoreArgs::slot); without one, the code of one session. kPaged: the keys in the pool's
+// pages. kRows: kDenseRows, or kMaxDecodeRows (groups of at most kDenseRows rows, each at the start of the
+// shared memory)
+template <bool kSlots, bool kPaged, int kRows>
 __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs a) {
   extern __shared__ __align__(16) uint8_t dsm[];
   __shared__ int slen[kRows], sslot[kRows];  // each row's own scan length, and its slot
@@ -768,8 +774,9 @@ __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs
       hb[i] = 0;
     }
     const int* rb = s.blocks ? s.blocks + (size_t)r0 * s.nblocks : nullptr;  // a block list: the group's one row
-    const uint32_t e0 = kSlots ? (uint32_t)sslot[r0] * s.slot_entries : 0u;  // the group's session's keys
-    TileKeys cur = load_tile(s, e0, rb, c * kDensePos + warp * 16, n, 0, lane);
+    const uint32_t e0 = kSlots && !kPaged ? (uint32_t)sslot[r0] * s.slot_entries : 0u;  // the group's session's keys
+    const KvPages pg = kPaged ? pages_at(s.pages, r0) : KvPages{};  // the group's session (its rows share a slot)
+    TileKeys cur = load_tile<kPaged>(s, pg, e0, rb, c * kDensePos + warp * 16, n, 0, lane);
     QIn qi = q_load(a.iq_pre + ((size_t)r0 * kIdxHeads + warp) * kIdxDim, s.pos[r0], a.table, lane);
     float wq = a.wproj[r0 * kIdxHeads + warp];
     for (int r = r0; r < r1; ++r) {  // the queries (warp h: head h of each row), the next row's loading
@@ -788,7 +795,7 @@ __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs
     for (; c < nchunks; c += stride) {
       const int i0 = c * kDensePos + warp * 16;
       TileKeys nxt = cur;
-      if (c + stride < nchunks) nxt = load_tile(s, e0, rb, i0 + stride * kDensePos, n, 0, lane);
+      if (c + stride < nchunks) nxt = load_tile<kPaged>(s, pg, e0, rb, i0 + stride * kDensePos, n, 0, lane);
       if (i0 < n)
         for (int r = r0; r < r1; ++r)
           score_tile_row(cur, sq[r - q0], ssc + (r - q0) * kIdxHeads, sw + (r - q0) * kIdxHeads, slen[r], i0, 0,
@@ -849,6 +856,16 @@ void index_q_prep(const uint16_t* iq_pre, const float* wproj, const int* pos, co
   CUDA_CHECK(cudaGetLastError());
 }
 
+// index_score's launch, by the pages' flag (the keys in the pool's pages or the contiguous arrays)
+template <bool kPaged>
+void score_launch(const ScoreArgs& a, int padded, int rows, const IndexScan& scan, cudaStream_t s) {
+  if (scan.blocks || rows == 1)
+    score_kernel<kPaged, 1><<<dim3(padded / kScorePos, rows), 128, 0, s>>>(a);
+  else
+    score_kernel<kPaged, 8><<<dim3(padded / kScorePos, (rows + 7) / 8), 128, 0, s>>>(a);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 void index_score(const IndexQ& q, const int* pos, int rows, int ratio, IndexKeys ik, const IndexScan& scan,
                  int max_scan, uint16_t* keys, int keys_stride, uint16_t* bkeys, int bkeys_stride, cudaStream_t s) {
   int nscan = scan.blocks ? scan.nblocks * 8 : max_scan;
@@ -856,13 +873,9 @@ void index_score(const IndexQ& q, const int* pos, int rows, int ratio, IndexKeys
   if (keys_stride < padded || (bkeys && (scan.blocks || bkeys_stride < padded / 8)) || ik.slot)
     die("index_score: strides %d/%d for %d (or a slot table)", keys_stride, bkeys_stride, nscan);
   ScoreArgs a{q.q, q.sc, q.w, pos, rows, ratio, ik.k, reinterpret_cast<const uint32_t*>(ik.sc), scan.part,
-              scan.nparts, scan.blocks, scan.nblocks, keys, keys_stride, bkeys, bkeys_stride, nullptr, 0};
-  if (scan.blocks || rows == 1) {
-    score_kernel<1><<<dim3(padded / kScorePos, rows), 128, 0, s>>>(a);
-  } else {
-    score_kernel<8><<<dim3(padded / kScorePos, (rows + 7) / 8), 128, 0, s>>>(a);
-  }
-  CUDA_CHECK(cudaGetLastError());
+              scan.nparts, scan.blocks, scan.nblocks, keys, keys_stride, bkeys, bkeys_stride, nullptr, 0, ik.pages};
+  if (ik.pages.paged()) score_launch<true>(a, padded, rows, scan, s);
+  else score_launch<false>(a, padded, rows, scan, s);
 }
 
 
@@ -931,6 +944,16 @@ static int slot_entries(const IndexKeys& ik, const char* who) {
   return ik.slot ? (int)(ik.k_stride / 64) : 0;
 }
 
+// The step's session table: the contiguous one, or the pages' (--shared-kv: model.cu's step_keys sets
+// pages.slot and leaves slot null). The kernels take it as their slot table either way.
+static const int* step_slots(const IndexKeys& ik) { return ik.slot ? ik.slot : ik.pages.slot; }
+
+using FusedKernel = void (*)(IndexFusedArgs);
+FusedKernel fused_kernel(bool slots, bool paged) {  // the session table x the pages' flag
+  if (paged) return slots ? index_fused_kernel<true, true> : index_fused_kernel<false, true>;
+  return slots ? index_fused_kernel<true, false> : index_fused_kernel<false, false>;
+}
+
 void index_fused(const uint16_t* iq_pre, const float* wproj, const int* pos, const float2* table, int rows, int ratio,
                  IndexKeys ik, const IndexScan& scan, int max_scan, uint16_t* keys, int keys_stride, uint16_t* bkeys,
                  int bkeys_stride, IndexSel top, IndexSel pool, int* counters, bool pdl, cudaStream_t s) {
@@ -938,32 +961,40 @@ void index_fused(const uint16_t* iq_pre, const float* wproj, const int* pos, con
   int padded = (nscan + kScorePos - 1) / kScorePos * kScorePos;
   if (keys_stride < padded || (bkeys && (scan.blocks || bkeys_stride < padded / 8)) || (pool.pos && !bkeys))
     die("index_fused: strides %d/%d for %d", keys_stride, bkeys_stride, nscan);
+  const int* slots = step_slots(ik);
   IndexFusedArgs a{};
   a.iq_pre = iq_pre;
   a.wproj = wproj;
   a.table = table;
   a.sc = ScoreArgs{nullptr, nullptr, nullptr, pos, rows, ratio, ik.k, reinterpret_cast<const uint32_t*>(ik.sc),
-                   scan.part, scan.nparts, scan.blocks, scan.nblocks, keys, keys_stride, bkeys, bkeys_stride,
-                   ik.slot, slot_entries(ik, "index_fused")};
+                   scan.part, scan.nparts, scan.blocks, scan.nblocks, keys, keys_stride, bkeys, bkeys_stride, slots,
+                   slot_entries(ik, "index_fused"), ik.pages};
   a.top = topk_args(keys, keys_stride, pos, rows, ratio, scan, false, top.kmax, top.pos, top.key, top.stride);
-  a.top.slot = ik.slot;
+  a.top.slot = slots;
   if (pool.pos) {
     a.pool = topk_args(bkeys, bkeys_stride, pos, rows, ratio, scan, true, pool.kmax, pool.pos, pool.key, pool.stride);
-    a.pool.slot = ik.slot;
+    a.pool.slot = slots;
   }
   a.counters = counters;
-  launch(ik.slot ? index_fused_kernel<true> : index_fused_kernel<false>,
-         dim3(std::max(1, (nscan + kFusedPos - 1) / kFusedPos), rows), dim3(kSelThreads), 0, s, pdl, a);
+  launch(fused_kernel(slots != nullptr, ik.pages.paged()), dim3(std::max(1, (nscan + kFusedPos - 1) / kFusedPos), rows),
+         dim3(kSelThreads), 0, s, pdl, a);
 }
 
 size_t index_dense_scratch() { return (kDenseHist + 2 * (size_t)kMaxDecodeRows * 2048) * sizeof(uint32_t); }
 
 namespace {
 using DenseKernel = void (*)(IndexDenseArgs);
-DenseKernel dense_kernel(bool slots, int rows) {  // up to kDenseRows rows, the instances of before B4
+// The instance for `slots` (a session table) x `paged` (the keys in the pool's pages) x the row grouping: up to
+// kDenseRows rows, or the instances of before B4.
+DenseKernel dense_kernel(bool slots, bool paged, int rows) {
+  if (paged) {
+    if (rows > kDenseRows)
+      return slots ? index_dense_kernel<true, true, kMaxDecodeRows> : index_dense_kernel<false, true, kMaxDecodeRows>;
+    return slots ? index_dense_kernel<true, true, kDenseRows> : index_dense_kernel<false, true, kDenseRows>;
+  }
   if (rows > kDenseRows)
-    return slots ? index_dense_kernel<true, kMaxDecodeRows> : index_dense_kernel<false, kMaxDecodeRows>;
-  return slots ? index_dense_kernel<true, kDenseRows> : index_dense_kernel<false, kDenseRows>;
+    return slots ? index_dense_kernel<true, false, kMaxDecodeRows> : index_dense_kernel<false, false, kMaxDecodeRows>;
+  return slots ? index_dense_kernel<true, false, kDenseRows> : index_dense_kernel<false, false, kDenseRows>;
 }
 int dense_sms() {  // the SM count; also the kernels' shared memory limit, once (outside any graph capture)
   static int sms = 0;
@@ -972,9 +1003,10 @@ int dense_sms() {  // the SM count; also the kernels' shared memory limit, once 
     CUDA_CHECK(cudaGetDevice(&dev));
     CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
     for (bool slots : {false, true})
-      for (int rows : {kDenseRows, kMaxDecodeRows})
-        CUDA_CHECK(cudaFuncSetAttribute(dense_kernel(slots, rows), cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        (int)kDenseSmem));
+      for (bool paged : {false, true})
+        for (int rows : {kDenseRows, kMaxDecodeRows})
+          CUDA_CHECK(cudaFuncSetAttribute(dense_kernel(slots, paged, rows),
+                                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kDenseSmem));
   }
   return sms;
 }
@@ -990,18 +1022,20 @@ void index_dense(const uint16_t* iq_pre, const float* wproj, const int* pos, con
     die("index_dense: %d rows, strides %d/%d for %d", rows, keys_stride, bkeys_stride, max_scan);
   const int sms = dense_sms();
   const IndexScan whole{};
+  const int* slots = step_slots(ik);
   IndexDenseArgs a{};
   a.iq_pre = iq_pre;
   a.wproj = wproj;
   a.table = table;
   a.sc = ScoreArgs{nullptr, nullptr, nullptr, pos, rows, ratio, ik.k, reinterpret_cast<const uint32_t*>(ik.sc), 0, 1,
-                   nullptr, 0, keys, keys_stride, bkeys, bkeys_stride, ik.slot, slot_entries(ik, "index_dense")};
+                   nullptr, 0, keys, keys_stride, bkeys, bkeys_stride, slots, slot_entries(ik, "index_dense"),
+                   ik.pages};
   a.top = topk_args(keys, keys_stride, pos, rows, ratio, whole, false, top.kmax, top.pos, top.key, top.stride);
   if (pool.pos)
     a.pool = topk_args(bkeys, bkeys_stride, pos, rows, ratio, whole, true, pool.kmax, pool.pos, pool.key, pool.stride);
   a.scratch = scratch;
   a.cap = cand < 0 ? kDenseCand : std::min(cand, kDenseCand);
-  launch(dense_kernel(ik.slot, rows), dim3(sms), dim3(kSelThreads), kDenseSmem, s, pdl, a);
+  launch(dense_kernel(slots != nullptr, ik.pages.paged(), rows), dim3(sms), dim3(kSelThreads), kDenseSmem, s, pdl, a);
 }
 
 void index_dense_blocks(const uint16_t* iq_pre, const float* wproj, const int* pos, const float2* table, int rows,
@@ -1013,16 +1047,18 @@ void index_dense_blocks(const uint16_t* iq_pre, const float* wproj, const int* p
   IndexScan scan{};
   scan.blocks = blocks;
   scan.nblocks = nblocks;
+  const int* slots = step_slots(ik);
   IndexDenseArgs a{};
   a.iq_pre = iq_pre;
   a.wproj = wproj;
   a.table = table;
   a.sc = ScoreArgs{nullptr, nullptr, nullptr, pos, rows, ratio, ik.k, reinterpret_cast<const uint32_t*>(ik.sc), 0, 1,
-                   blocks, nblocks, keys, keys_stride, nullptr, 0, ik.slot, slot_entries(ik, "index_dense_blocks")};
+                   blocks, nblocks, keys, keys_stride, nullptr, 0, slots, slot_entries(ik, "index_dense_blocks"),
+                   ik.pages};
   a.top = topk_args(keys, keys_stride, pos, rows, ratio, scan, false, top.kmax, top.pos, top.key, top.stride);
   a.scratch = scratch;
   a.cap = cand < 0 ? kDenseCand : std::min(cand, kDenseCand);
-  launch(dense_kernel(ik.slot, rows), dim3(sms), dim3(kSelThreads), kDenseSmem, s, pdl, a);
+  launch(dense_kernel(slots != nullptr, ik.pages.paged(), rows), dim3(sms), dim3(kSelThreads), kDenseSmem, s, pdl, a);
 }
 
 void index_merge2(int rows, const int* cand_pos, const uint16_t* cand_key, int n, IndexSel top, const int* pcand_pos,

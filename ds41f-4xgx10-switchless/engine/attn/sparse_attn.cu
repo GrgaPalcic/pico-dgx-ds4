@@ -72,7 +72,8 @@ __device__ __forceinline__ uint32_t finish_pair(float x0, float x1, int d, const
 
 // grid (splits, rows), 4 warps. Block b of a row: b < nwin are window positions wlo + 64b + i (up to whi),
 // the rest compressed entries topk[r][64(b-nwin) + i]. Warp w scores keys 16w..16w+15 and owns output dims
-// 128w..128w+127.
+// 128w..128w+127. kPaged: the compressed entries in the pool's pages (the accessors of attn.h).
+template <bool kPaged>
 __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
   extern __shared__ __align__(16) uint8_t smem_raw[];
   __shared__ float e2m1_lut[16];  // e2m1_to_f by table: the compressed blocks' decode is ALU-bound otherwise
@@ -161,9 +162,8 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
 #pragma unroll
       for (int kk = 0; kk < 16; ++kk) {
         int kp = __shfl_sync(0xffffffffu, my_kp, kk);
-        c[kk] = kp >= 0 ? *reinterpret_cast<const uint2*>(ckv.kv + (size_t)kp * (kHead / 2) + lane * 8)
-                        : make_uint2(0, 0);
-        e[kk] = kp >= 0 ? ckv.sc[(size_t)kp * 32 + lane] : 0u;
+        c[kk] = kp >= 0 ? *reinterpret_cast<const uint2*>(ckv.kv_at<kPaged>(kp) + lane * 8) : make_uint2(0, 0);
+        e[kk] = kp >= 0 ? ckv.sc_at<kPaged>(kp)[lane] : 0u;
       }
 #pragma unroll
       for (int kk = 0; kk < 16; ++kk) {
@@ -340,7 +340,8 @@ void sparse_attn(const uint16_t* q_pre, const int* pos, WinBounds wb, int rows, 
                  Compressed ckv, const int* topk, int kmax, const float* sink, uint16_t* out, int splits,
                  AttnScratch scratch, cudaStream_t s, bool pdl) {
   static bool once = [] {
-    CUDA_CHECK(cudaFuncSetAttribute(attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kAttnSmem));
+    CUDA_CHECK(cudaFuncSetAttribute(attn_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kAttnSmem));
+    CUDA_CHECK(cudaFuncSetAttribute(attn_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kAttnSmem));
     return true;
   }();
   (void)once;
@@ -367,7 +368,8 @@ void sparse_attn(const uint16_t* q_pre, const int* pos, WinBounds wb, int rows, 
   a.out = out;
   a.po = scratch.o;
   a.pml = scratch.ml;
-  launch(attn_kernel, dim3(a.splits, rows), dim3(128), kAttnSmem, s, pdl, a);
+  launch(ckv.pages.paged() ? attn_kernel<true> : attn_kernel<false>, dim3(a.splits, rows), dim3(128), kAttnSmem, s, pdl,
+         a);
   CUDA_CHECK(cudaGetLastError());
   if (a.splits > 1) {
     launch(attn_combine_kernel, dim3(rows, kHeads), dim3(kHead / 4), 0, s, pdl, (const float*)scratch.o,

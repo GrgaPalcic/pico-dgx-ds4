@@ -8,7 +8,7 @@ namespace dsk {
 
 namespace {
 
-// One CTA per row (K/8 threads, at most 1024).
+// One CTA per row (K/8 threads, at most 1024; the caller may give another multiple of 32).
 __global__ void __launch_bounds__(1024) k_rmsnorm(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
                                                   int D, float eps, __nv_bfloat16* __restrict__ y, uint8_t* __restrict__ q,
                                                   uint8_t* __restrict__ s) {
@@ -68,9 +68,10 @@ void router_topk_oea(const float* logits, const float* bias, int M, int E, int* 
 }
 
 void rmsnorm(const __nv_bfloat16* x, const __nv_bfloat16* w, int M, int D, float eps, __nv_bfloat16* y, uint8_t* q,
-             uint8_t* s, cudaStream_t st) {
+             uint8_t* s, cudaStream_t st, int blk) {
   if (D % 256 || D > 8192) die("rmsnorm: D=%d", D);
-  launch_pdl(k_rmsnorm, dim3(M), dim3(D / 8), 0, st, true, x, w, D, eps, y, q, s);
+  if (blk && (blk % 32 || blk > 1024)) die("rmsnorm: blk=%d", blk);
+  launch_pdl(k_rmsnorm, dim3(M), dim3(blk ? blk : D / 8), 0, st, true, x, w, D, eps, y, q, s);
 }
 
 void router_topk(const float* logits, const float* bias, int M, int E, int* idx, float* wts, float route_scale,
