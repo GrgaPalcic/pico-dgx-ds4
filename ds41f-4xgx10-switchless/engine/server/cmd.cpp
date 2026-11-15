@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 
 #include "common/check.h"
+#include "dspark/dspark.h"
 #include "model/nvtx.h"
 
 namespace srv {
@@ -315,6 +316,33 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
           for (int k = 0; k < c.sp.n_top; ++k) std::fprintf(slog, "%s%.3f", k ? "," : "", o.top_lp[j][k] > -1e30f ? o.top_lp[j][k] : -99.f);
           std::fprintf(slog, "]");
         }
+        std::fprintf(slog, "]");
+      }
+      // DIAGNOSTICS (DSGB10_DRAFT_PROBE, serve's one-session spec step): the drafter's probe's top-5 per
+      // depth, their probabilities and the confidence head's logits (the probe's path is the session's own
+      // drafts, Options::draft_probe)
+      static const bool slog_dk = [] {
+        const char* v = getenv("DSGB10_DRAFT_PROBE");
+        return v && *v;
+      }();
+      if (slog_dk) {
+        dspark::ProbeOut p;
+        static_assert(sizeof p == sizeof o.probe, "ProbeOut");
+        std::memcpy(&p, o.probe, sizeof p);
+        std::fprintf(slog, ",\"dk\":[");
+        for (int j = 0; j < kD; ++j) {
+          std::fprintf(slog, "%s[", j ? "," : "");
+          for (int k = 0; k < 5; ++k) std::fprintf(slog, "%s%d", k ? "," : "", p.id[j][k]);
+          std::fprintf(slog, "]");
+        }
+        std::fprintf(slog, "],\"dp\":[");
+        for (int j = 0; j < kD; ++j) {
+          std::fprintf(slog, "%s[", j ? "," : "");
+          for (int k = 0; k < 5; ++k) std::fprintf(slog, "%s%.5f", k ? "," : "", p.p[j][k]);
+          std::fprintf(slog, "]");
+        }
+        std::fprintf(slog, "],\"dc\":[");
+        for (int j = 0; j < kD; ++j) std::fprintf(slog, "%s%.5f", j ? "," : "", p.conf[j]);
         std::fprintf(slog, "]");
       }
       std::fprintf(slog, "}\n");

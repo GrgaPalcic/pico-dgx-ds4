@@ -904,6 +904,24 @@ sample, rejected rows included); `DSGB10_SUBMIT_LOG=FILE` (serve, rank 0) append
 first run, with its plan — session and base ids, slot, prompt length, restart point, cached count — and
 the prompt's full token ids. With neither variable set, every code path, log line and output is as before.
 
+Three more (issue #18: the drafter's top-5, the indexer's selections and Engram's read latency) are gated the
+same way: with none of `DSGB10_DRAFT_PROBE`, `DSGB10_INDEX_DUMP`, `DSGB10_INDEX_DUMP_STEPS` and
+`DSGB10_ENGRAM_STATS` set, no captured graph node, kernel launch, allocation, log line or output byte differs.
+`DSGB10_DRAFT_PROBE=1` (serve) runs the one-session spec step's draft probe along the session's own draft
+tokens, and appends to the `DSGB10_STEP_LOG` line the five depths' top-5 ids (`"dk"`), their probabilities
+(`"dp"`, `%.5f`) and the confidence head's logits (`"dc"`, `%.5f`); `--tree-probe` keeps its spectf meaning.
+`DSGB10_INDEX_DUMP=FILE` (rank 0) writes each decode step's index-layer selections, little-endian: magic
+`IDX1`, step, R, the append's CLOCK_REALTIME ns, `n_layers`, `layer[n_layers]`, `slot[R]`, `pos[R]` and
+`sel[n_layers][R][512]` (the positions as the indexer writes them; -1: unused); `DSGB10_INDEX_DUMP_STEPS=N`
+(default 1000) stops the appends, and
+[index_read.py](../engine/server/tools/index_read.py) reads the file — one JSON line a record, `--summary`
+the record count and, per layer, the mean overlap of consecutive steps' selections of the same slot.
+`DSGB10_ENGRAM_STATS=PATH` (every rank) writes `PATH.rank<r>`, mode 0600, one JSON line a second and one at
+destruction: `{"t": ns, "rank": r, "requests", "lookups", "hits", "joined", "reads", "read_bytes",
+"evictions", "pad_reads", "lat_us": [24]}`, the counters cumulative and every record read's
+submit-to-completion latency in log2-microsecond buckets (bucket b: [2^b, 2^(b+1)) us; bucket 0 also takes
+< 1 us). The three are for test windows with public prompts, never production.
+
 ### As a service: service.sh
 
 [service.sh](../engine/server/service.sh) runs the engine and the front-end as a service: the four

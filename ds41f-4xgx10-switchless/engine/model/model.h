@@ -144,6 +144,10 @@ struct Options {
   // EXPERIMENT, bench only (docs/engine.md, "Draft trees"): every spec step's draft pass also runs the
   // drafter's probe (dspark::Draft::probe) along SpecCfg::probe, into SampleOut::probe
   bool tree_probe = false;
+  // DIAGNOSTICS (DSGB10_DRAFT_PROBE, serve's one-session spec step): the probe runs along the session's own
+  // draft tokens (dspark::Draft::tokens()) instead of SpecCfg::probe, so its depths are draft()'s chain. It
+  // implies tree_probe; --tree-probe keeps its spectf meaning (SpecCfg::probe's path).
+  bool draft_probe = false;
 };
 
 // The store's counters (state.h, `--stats-file`): what the disk tier and the shared pool did, since

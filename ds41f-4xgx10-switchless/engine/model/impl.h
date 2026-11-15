@@ -116,6 +116,17 @@ struct Prefill;  // prefill.cu's buffers
 struct Store;    // state.cu's sessions
 struct Spec;     // spec.cu's draft module and spec steps
 
+// DIAGNOSTICS (model.cu k_idx_copy, DSGB10_INDEX_DUMP=FILE on rank 0): a decode step's index-layer selections,
+// one ring entry a step, as the indexer leaves them (a row's entries [k, kIdxTopk) are -1, unused). The host
+// appends each finished step to FILE (wait()).
+constexpr int kIdxRing = 8;
+struct IdxRec {
+  uint32_t step;
+  int32_t R;
+  int32_t slot[kMaxRows], pos[kMaxRows];
+  int32_t sel[kIdxSlots][kMaxRows][kIdxTopk];
+};
+
 }  // namespace detail
 
 struct Model::Impl {
@@ -232,6 +243,13 @@ struct Model::Impl {
 
   detail::RouteRec* route_ring = nullptr;  // DSGB10_ROUTE_DUMP
   FILE* route_f = nullptr;
+  // DIAGNOSTICS (DSGB10_INDEX_DUMP=FILE, DSGB10_INDEX_DUMP_STEPS=N, rank 0): the decode steps' index-layer
+  // selections; idx_hdr_layer writes the ring entry's step, rows, slots and positions, idx_written stops the
+  // host appends at idx_steps records
+  detail::IdxRec* idx_ring = nullptr;
+  FILE* idx_f = nullptr;
+  int idx_hdr_layer = -1;
+  uint64_t idx_written = 0, idx_steps = 0;
 
   // re-laying weights the file holds in their natural layout (freed after bind)
   uint8_t* scratch = nullptr;
@@ -247,6 +265,9 @@ struct Model::Impl {
   std::unique_ptr<detail::Store> store_s;
   std::unique_ptr<detail::Spec> spec;
   bool mh_on = false;  // capturing a spec step: main_hidden at the inputs of layers 37-39
+  // DIAGNOSTICS (Options::draft_probe, DSGB10_DRAFT_PROBE): device [dspark::kDraft], the one-session spec
+  // step's own draft tokens, which its probe's path then is
+  int* probe_path = nullptr;
   // stack4, the certified head (DSGB10_CERT=1; one-session spec steps whose rows are all greedy without top logprobs):
   // a coarse read of every vocabulary row (the drafter's FP8 copy of the head) with a rigorous bound per row, one
   // cross-rank threshold per step row, and the exact head kernel on the CTAs that the bound cannot exclude. The

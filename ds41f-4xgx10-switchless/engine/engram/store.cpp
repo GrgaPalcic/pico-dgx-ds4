@@ -10,9 +10,14 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -142,11 +147,31 @@ struct Store::Impl {
   std::atomic<uint64_t> st_requests{0}, st_lookups{0}, st_hits{0}, st_joined{0}, st_reads{0}, st_bytes{0},
       st_evictions{0}, st_pads{0};
 
+  // DIAGNOSTICS (DSGB10_ENGRAM_STATS=PATH): rank r's JSON lines go to PATH.rank<r>, one every 1.0 s and one
+  // at destruction, from the counters above and st_lat; sub_ns holds the preps' steady-clock ns by SQE
+  // (user_data), so a completion can measure the read. All of it exists only while the variable is set.
+  bool stats_on = false;
+  std::vector<uint64_t> sub_ns;
+  std::atomic<uint64_t> st_lat[24] = {};
+  FILE* stats_f = nullptr;
+  std::thread sampler;
+  std::atomic<bool> samp_stop{false};
+
   Impl(const StoreConfig& c, const HashMap& m) : cfg(c), sp(Split::of(m)) {
     for (int l = 0; l < kLayers; l++) table_rows[l] = m.num_embeddings[l];
     if (cfg.rank < -1 || cfg.rank >= kWorld) die("engram: bad rank %d", cfg.rank);
     open_sources(m);
     qd = cfg.queue_depth < 1 ? 1 : cfg.queue_depth;
+    if (const char* es = getenv("DSGB10_ENGRAM_STATS"); es && *es) {
+      stats_on = true;
+      sub_ns.assign(size_t(2) * qd, 0);
+      for (auto& v : st_lat) v.store(0, std::memory_order_relaxed);
+      const std::string path = std::string(es) + ".rank" + std::to_string(cfg.rank);
+      const int fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+      if (fd < 0) die("engram: DSGB10_ENGRAM_STATS %s", path.c_str());
+      stats_f = fdopen(fd, "a");
+      if (!stats_f) die("engram: DSGB10_ENGRAM_STATS %s", path.c_str());
+    }
     ring = std::make_unique<Uring>(unsigned(2 * qd));
     ring->register_files(fds.data(), unsigned(fds.size()));
     bounce_bytes = (size_t(qd) * 2 + 1) * kWin;
@@ -164,9 +189,16 @@ struct Store::Impl {
     for (size_t i = max_wait; i-- > 0;) free_waiters.push_back(uint32_t(i));
     cache.init(cfg.cache_bytes);
     worker = std::thread([this] { run(); });
+    if (stats_on) sampler = std::thread([this] { stats_run(); });  // DIAGNOSTICS (DSGB10_ENGRAM_STATS)
   }
 
   ~Impl() {
+    if (stats_on) {  // the last line, then the file goes
+      samp_stop.store(true, std::memory_order_seq_cst);
+      sampler.join();
+      std::fclose(stats_f);
+      stats_f = nullptr;
+    }
     stop.store(true, std::memory_order_seq_cst);
     wake();
     worker.join();
@@ -238,6 +270,48 @@ struct Store::Impl {
   void wake() {
     futex_word.fetch_add(1, std::memory_order_seq_cst);
     syscall(SYS_futex, &futex_word, FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+  }
+
+  // ---- DIAGNOSTICS (DSGB10_ENGRAM_STATS): the counters' JSON lines -----------------------------
+  StoreStats snapshot() const {
+    StoreStats s;
+    s.requests = st_requests.load(std::memory_order_relaxed);
+    s.lookups = st_lookups.load(std::memory_order_relaxed);
+    s.hits = st_hits.load(std::memory_order_relaxed);
+    s.joined = st_joined.load(std::memory_order_relaxed);
+    s.reads = st_reads.load(std::memory_order_relaxed);
+    s.read_bytes = st_bytes.load(std::memory_order_relaxed);
+    s.evictions = st_evictions.load(std::memory_order_relaxed);
+    s.pad_reads = st_pads.load(std::memory_order_relaxed);
+    for (int b = 0; b < 24; ++b) s.lat_us[b] = st_lat[b].load(std::memory_order_relaxed);
+    return s;
+  }
+  void stats_line() {
+    const StoreStats s = snapshot();
+    timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    const uint64_t t = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    char lat[24 * 22];
+    int o = 0;
+    for (int b = 0; b < 24; ++b)
+      o += std::snprintf(lat + o, sizeof lat - (size_t)o, "%s%llu", b ? "," : "", (unsigned long long)s.lat_us[b]);
+    std::fprintf(stats_f,
+                 "{\"t\": %llu, \"rank\": %d, \"requests\": %llu, \"lookups\": %llu, \"hits\": %llu, \"joined\": %llu, "
+                 "\"reads\": %llu, \"read_bytes\": %llu, \"evictions\": %llu, \"pad_reads\": %llu, \"lat_us\": [%s]}\n",
+                 (unsigned long long)t, cfg.rank, (unsigned long long)s.requests, (unsigned long long)s.lookups,
+                 (unsigned long long)s.hits, (unsigned long long)s.joined, (unsigned long long)s.reads,
+                 (unsigned long long)s.read_bytes, (unsigned long long)s.evictions, (unsigned long long)s.pad_reads,
+                 lat);
+    std::fflush(stats_f);
+  }
+  // One line a second, and one more when the store is destroyed (samp_stop, checked in 50 ms slices).
+  void stats_run() {
+    for (;;) {
+      for (int i = 0; i < 20 && !samp_stop.load(std::memory_order_relaxed); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      stats_line();
+      if (samp_stop.load(std::memory_order_relaxed)) return;
+    }
   }
 
   // ---- worker ----
@@ -346,6 +420,7 @@ struct Store::Impl {
         io_uring_sqe* q = ring->sqe();
         if (!q) die("engram: submission ring full");
         ring->prep_read_fixed(q, file, buf + idx * kWin, unsigned(e - a), a, 0, (uint64_t(si) << 1) | unsigned(idx));
+        if (stats_on) sub_ns[(uint64_t(si) << 1) | unsigned(idx)] = now_ns();  // DIAGNOSTICS: the read's submit
         unseen++;
         s.rec_off[idx] = uint16_t(off - a);
         s.need[idx] = uint16_t(off - a + len);
@@ -408,6 +483,10 @@ struct Store::Impl {
       did = true;
       const uint32_t si = uint32_t(c.user_data >> 1);
       const unsigned idx = unsigned(c.user_data & 1);
+      if (stats_on) {  // DIAGNOSTICS: this read's latency, submit to completion, in log2 us buckets
+        const uint64_t us = (now_ns() - sub_ns[c.user_data]) / 1000;
+        st_lat[us < 1 ? 0 : std::min(23, 63 - __builtin_clzll(us))].fetch_add(1, std::memory_order_relaxed);
+      }
       Slot& s = slots[si];
       if (c.res < int(s.need[idx])) die("engram: read returned %d, needed %u", c.res, unsigned(s.need[idx]));
       if (--s.parts_left == 0) finish(si);
@@ -511,15 +590,7 @@ void Store::submit(const Request& r) { impl_->submit(r); }
 const Split& Store::split() const { return impl_->sp; }
 
 StoreStats Store::stats() const {
-  StoreStats s;
-  s.requests = impl_->st_requests.load(std::memory_order_relaxed);
-  s.lookups = impl_->st_lookups.load(std::memory_order_relaxed);
-  s.hits = impl_->st_hits.load(std::memory_order_relaxed);
-  s.joined = impl_->st_joined.load(std::memory_order_relaxed);
-  s.reads = impl_->st_reads.load(std::memory_order_relaxed);
-  s.read_bytes = impl_->st_bytes.load(std::memory_order_relaxed);
-  s.evictions = impl_->st_evictions.load(std::memory_order_relaxed);
-  s.pad_reads = impl_->st_pads.load(std::memory_order_relaxed);
+  StoreStats s = impl_->snapshot();
   return s;
 }
 

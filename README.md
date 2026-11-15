@@ -6,9 +6,10 @@ upstream's README, unchanged except where our changes needed a line.
 
 ## What is upstream's, and what this fork adds
 
-Upstream already has the session store, the NVMe disk tier (`--disk-gib`, default 32 GiB) and kept sessions across a
-planned stop. Its [docs/batching.md](ds41f-4xgx10-switchless/docs/batching.md) names the design this fork builds:
-"attention reading the store's pages through a per-session page table: no copies". This fork implements that and adds:
+Upstream (Andy Shu's dsgb10, carried in Pico's fork) already has the session store, the NVMe disk tier (`--disk-gib`,
+default 32 GiB) and kept sessions across a planned stop. Its [docs/batching.md](ds41f-4xgx10-switchless/docs/batching.md)
+(from Andy Shu's dsgb10) names the design this fork builds: "attention reading the store's pages through a
+per-session page table: no copies". This fork implements that and adds:
 
 - **One shared KV pool** (`--shared-kv`): every live slot and every stored session takes 3.5 MiB pages from one pool
   a box, through a per-slot page table. A live slot reserves 5.9 MiB of its own instead of up to 895.4 MiB, so every
@@ -33,8 +34,9 @@ FLEET=~/fleet.conf DSGB10_ENGINE_ARGS="--max-ctx 1048576 --slots 16 --shared-kv 
 ```
 
 We run without `DSGB10_OEA` and the wide64 steps, so a reply equals the same request sent alone at any concurrency.
-That costs up to ~28 % of aggregate throughput at 16 streams
-([shared-kv-results.md §4.6](ds41f-4xgx10-switchless/docs/shared-kv-results.md)).
+That costs 0–28 % of aggregate throughput at 16 streams depending on the bench (§4.6 of
+[shared-kv-results.md](ds41f-4xgx10-switchless/docs/shared-kv-results.md): 174 against 241.5 tok/s served, across
+two builds; 329 lossless against 311 OEA + WIDE and 363 OEA only in one multistream window).
 
 ## Results
 
@@ -45,17 +47,19 @@ and builds, are [docs/shared-kv-results.md](ds41f-4xgx10-switchless/docs/shared-
   same total memory (§3.1).
 - One 17 GiB pool a box: 4,973 pages, 20,369,408 positions (§3.1).
 - The golden reference hashes: 8 of 8 with the flag on and off (§2.1).
-- The served gate: 0 of 5 concurrent replies differ from their cold alone replies; written-through copies cost
-  0.1–0.4 % of decode speed against the same build with copies off (release notes of
-  [v0.1.0](https://github.com/GrgaPalcic/pico-dgx-ds4/releases/tag/v0.1.0)).
-- Not measured: a full 128 GiB disk tier (how many sessions it holds is arithmetic, ~80 MiB a 32K session), and
-  16 live sessions at 1M at once (§3.2).
+- The served gate: 0 of 5 concurrent replies differ from their cold alone replies (the base passes the same gate);
+  written-through copies cost 0.1–0.5 % of decode speed against the same build with copies off, inside the
+  run-to-run spread (release notes of [v0.1.0](https://github.com/GrgaPalcic/pico-dgx-ds4/releases/tag/v0.1.0)).
+- Not measured: a full 128 GiB disk tier (how many sessions it holds is arithmetic: the drill's 28.8K-token session
+  took 0.08 GiB, so ~1,400–1,600 of 32K), 16 live sessions at 1M at once (§3.2; 600K is the largest measured), and a
+  crash of a worker rank or a power loss (only `kill -9` of rank 0 was drilled).
 
 ## How it was built
 
-The task agents that wrote the code ran DeepSeek V4.1 Flash, served by this same 4-Spark cluster; an orchestrating
-agent reviewed and merged their work and ran the GPU tests, inside test windows we designed and gated (golden hashes,
-the serve tests, the share gate). Commits carry no per-agent attribution.
+Task agents running DeepSeek V4.1 Flash on this cluster wrote most of the changes (22 tasks); an orchestrating coding
+agent merged them, ran the GPU tests, and wrote the fixes those tests demanded (page offsets, graph capture, live
+restarts and copy-on-write, the wide-step offset). We wrote the target design and approved the design note. Commits
+carry no per-agent attribution.
 
 Note: `#N` issue numbers in the docs refer to our internal tracker.
 

@@ -125,6 +125,10 @@ struct StoreStats {
   uint64_t requests = 0, lookups = 0, hits = 0, joined = 0;  // joined: miss on a row already in flight
   uint64_t reads = 0, read_bytes = 0, evictions = 0;
   uint64_t pad_reads = 0;  // discarded reads that rounded a batch up to read_batch
+  // DIAGNOSTICS (DSGB10_ENGRAM_STATS): the record reads' latencies, submit to completion, in log2 buckets
+  // of microseconds (bucket b: [2^b, 2^(b+1)) us; bucket 0 also takes < 1 us). Counted only while the
+  // variable is set; the discarded reads (pad, keep-alive) are not.
+  uint64_t lat_us[24] = {};
 };
 
 class Store {

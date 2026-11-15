@@ -607,6 +607,12 @@ int main(int argc, char** argv) {
   mo.draft_fp8 = a.draft_fp8;
   mo.draft_head4 = a.draft_head4, mo.draft_markov8 = a.draft_markov8;
   mo.tree_probe = !a.tree_probe.empty();
+  // DIAGNOSTICS (DSGB10_DRAFT_PROBE): serve's one-session spec step probes along the session's own drafts
+  // (Options::draft_probe; it turns the probe on itself). --tree-probe above keeps its spectf meaning.
+  if (const char* dp = getenv("DSGB10_DRAFT_PROBE"); dp && *dp) {
+    if (a.mode != "serve") die("DSGB10_DRAFT_PROBE=%s: --mode serve only (its one-session spec step)", dp);
+    mo.draft_probe = true, mo.tree_probe = true;
+  }
   mo.slots = a.slots;
   mo.big_slots = a.big_slots;
   mo.shared_kv = a.shared_kv;

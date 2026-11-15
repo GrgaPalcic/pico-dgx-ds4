@@ -82,6 +82,25 @@ __global__ void k_route_copy(const int* ridx, const ops::StepIn* in, int L, Rout
 // top_sc[kLayers][R][kRouteTop]. engine/server/tools/route_read.py reads it.
 constexpr char kRouteMagic[4] = {'R', 'T', 'D', '2'};
 constexpr size_t kRouteHdr = 4 + 4 + 4 + 8;  // magic, step, R, t_ns
+// The host's record of a finished step's index-layer selections (wait()): magic "IDX1", step, R, t_ns, then
+// n_layers, layer[n_layers], slot[R], pos[R] and sel[n_layers][R][kIdxTopk].
+// engine/server/tools/index_read.py reads it.
+constexpr char kIdxMagic[4] = {'I', 'D', 'X', '1'};
+constexpr size_t kIdxHdr = 4 + 4 + 4 + 8;  // magic, step, R, t_ns
+
+// DIAGNOSTICS (DSGB10_INDEX_DUMP=FILE, rank 0): an index layer's top-k rows of the step into its ring entry
+// (IdxRec). The first index layer of the step's first row group writes the entry's step, rows, slots and
+// positions; every layer copies its own rows. The host appends the entry to FILE (wait()).
+__global__ void k_idx_copy(const int* tk, const ops::StepIn* in, int L, int r0, int m, int hdr, IdxRec* ring) {
+  IdxRec& rr = ring[in->step % kIdxRing];
+  if (hdr && blockIdx.x == 0 && threadIdx.x < kMaxRows) {
+    rr.slot[threadIdx.x] = in->slot[threadIdx.x], rr.pos[threadIdx.x] = in->pos[threadIdx.x];
+    if (threadIdx.x == 0) rr.R = in->rows < kMaxRows ? in->rows : kMaxRows, rr.step = in->step;
+  }
+  int32_t* out = rr.sel[idx_slot(L)][r0];
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < m * kIdxTopk; i += gridDim.x * blockDim.x)
+    out[i] = tk[i];
+}
 
 __global__ void route_rotate(float* gl, int shift, int group) {
   __shared__ float s[kExperts];
@@ -173,6 +192,19 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
     route_ring = dalloc<RouteRec>(kRouteRing);
     route_f = fopen(rd, "wb");
     if (!route_f) die("model: DSGB10_ROUTE_DUMP %s", rd);
+  }
+  // DIAGNOSTICS (DSGB10_INDEX_DUMP): rank 0's decode steps' index-layer selections (engine/server/tools/
+  // index_read.py reads them); DSGB10_INDEX_DUMP_STEPS=N (default 1000) stops the appends after N records
+  if (const char* id = getenv("DSGB10_INDEX_DUMP"); id && *id && rank == 0) {
+    idx_ring = dalloc<IdxRec>(kIdxRing);
+    idx_f = fopen(id, "wb");
+    if (!idx_f) die("model: DSGB10_INDEX_DUMP %s", id);
+    idx_steps = getenv("DSGB10_INDEX_DUMP_STEPS") ? std::strtoull(getenv("DSGB10_INDEX_DUMP_STEPS"), nullptr, 10) : 1000;
+    for (int L = std::max(0, opt.first_layer); L < std::min(kLayers, opt.n_layers); ++L)
+      if (idx_src(L)) {
+        idx_hdr_layer = L;
+        break;
+      }
   }
   rope_plain = dalloc<float2>((size_t)opt.max_ctx * 32);
   rope_yarn = dalloc<float2>((size_t)opt.max_ctx * 32);
@@ -679,13 +711,17 @@ void Model::Impl::indexer(int L, int R, int ctx) {
     if (reindex(L)) {
       attn::index_dense_blocks(iq, wp, pos_d + r0, rope_yarn, m, ratio, ik, pool + (size_t)r0 * kPoolBlocks, kPoolBlocks,
                                keys, kstride, top, dense_scratch, true, st);
-      continue;
+    } else {
+      const attn::IndexSel ps = L == 20 ? attn::IndexSel{kPoolBlocks, pool + (size_t)r0 * kPoolBlocks,
+                                                         poolkey + (size_t)r0 * kPoolBlocks, kPoolBlocks}
+                                        : attn::IndexSel{};
+      attn::index_dense(iq, wp, pos_d + r0, rope_yarn, m, ratio, ik, ctx / ratio, keys, kstride, bkeys, kstride / 8, top, ps,
+                        dense_scratch, true, st);
     }
-    const attn::IndexSel ps = L == 20 ? attn::IndexSel{kPoolBlocks, pool + (size_t)r0 * kPoolBlocks,
-                                                       poolkey + (size_t)r0 * kPoolBlocks, kPoolBlocks}
-                                      : attn::IndexSel{};
-    attn::index_dense(iq, wp, pos_d + r0, rope_yarn, m, ratio, ik, ctx / ratio, keys, kstride, bkeys, kstride / 8, top, ps,
-                      dense_scratch, true, st);
+    // DIAGNOSTICS (DSGB10_INDEX_DUMP): this group's rows into the step's ring entry
+    if (idx_ring)
+      k_idx_copy<<<(m * kIdxTopk + 1023) / 1024, 1024, 0, st>>>(topk[slot] + (size_t)r0 * kIdxTopk, in_d, L, r0, m,
+                                                                r0 == 0 && L == idx_hdr_layer, idx_ring);
   }
 }
 
@@ -1090,7 +1126,9 @@ const ops::SampleOut& Model::Impl::wait(uint64_t n) {
       std::memcpy(rec.data() + 4, &step, 4);
       std::memcpy(rec.data() + 8, &R, 4);
       std::memcpy(rec.data() + 12, &t_ns, 8);
-      CUDA_CHECK(cudaMemcpy(rec.data() + kRouteHdr, &r->slot, 2 * (size_t)R * 4, cudaMemcpyDeviceToHost));
+      // slot[R] then pos[R]: two copies, since RouteRec holds kMaxRows of each
+      CUDA_CHECK(cudaMemcpy(rec.data() + kRouteHdr, r->slot, (size_t)R * 4, cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(rec.data() + kRouteHdr + (size_t)R * 4, r->pos, (size_t)R * 4, cudaMemcpyDeviceToHost));
       const int lo = std::max(0, opt.first_layer), hi = std::min(kLayers, opt.n_layers);
       if (hi > lo) {  // the layers' rows, one strided copy a field (the ring holds kMaxRows rows of each)
         CUDA_CHECK(cudaMemcpy2D(rec.data() + off_e + (size_t)lo * per_e, per_e, r->e[lo],
@@ -1101,6 +1139,44 @@ const ops::SampleOut& Model::Impl::wait(uint64_t n) {
                                 (size_t)kMaxRows * kRouteTop * 4, per_sc, hi - lo, cudaMemcpyDeviceToHost));
       }
       std::fwrite(rec.data(), 1, rec.size(), route_f), std::fflush(route_f);
+    }
+  }
+  // DIAGNOSTICS (DSGB10_INDEX_DUMP): the step's index-layer selections, little-endian: magic "IDX1", step, R,
+  // the append's CLOCK_REALTIME ns, n_layers, layer[n_layers], slot[R], pos[R], sel[n_layers][R][kIdxTopk].
+  // engine/server/tools/index_read.py reads it. Steps without an index layer (a prefill, an overwritten one)
+  // leave nothing; the appends stop at DSGB10_INDEX_DUMP_STEPS records.
+  if (idx_f && idx_written < idx_steps) {
+    const IdxRec* r = idx_ring + n % kIdxRing;
+    uint32_t step = 0;
+    int32_t R = 0;
+    CUDA_CHECK(cudaMemcpy(&step, &r->step, 4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&R, &r->R, 4, cudaMemcpyDeviceToHost));
+    if (step == (uint32_t)n && R > 0) {
+      R = std::min<int>(R, kMaxRows);
+      int layer[kIdxSlots], nl = 0;
+      const int lo = std::max(0, opt.first_layer), hi = std::min(kLayers, opt.n_layers);
+      for (int L = lo; L < hi; ++L)
+        if (idx_src(L)) layer[nl++] = L;
+      const size_t off_layer = kIdxHdr + 4, off_slot = off_layer + 4 * (size_t)nl;
+      const size_t off_pos = off_slot + 4 * (size_t)R, off_sel = off_pos + 4 * (size_t)R;
+      std::vector<uint8_t> rec(off_sel + (size_t)nl * R * kIdxTopk * 4);
+      timespec ts;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      const uint64_t t_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+      std::memcpy(rec.data(), kIdxMagic, 4);
+      std::memcpy(rec.data() + 4, &step, 4);
+      std::memcpy(rec.data() + 8, &R, 4);
+      std::memcpy(rec.data() + 12, &t_ns, 8);
+      std::memcpy(rec.data() + kIdxHdr, &nl, 4);
+      std::memcpy(rec.data() + off_layer, layer, 4 * (size_t)nl);
+      CUDA_CHECK(cudaMemcpy(rec.data() + off_slot, r->slot, 4 * (size_t)R, cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(rec.data() + off_pos, r->pos, 4 * (size_t)R, cudaMemcpyDeviceToHost));
+      for (int i = 0; i < nl; ++i)  // the ring holds kMaxRows rows of each; the record's are the step's
+        CUDA_CHECK(cudaMemcpy2D(rec.data() + off_sel + (size_t)i * R * kIdxTopk * 4, (size_t)R * kIdxTopk * 4,
+                                r->sel[idx_slot(layer[i])], (size_t)kMaxRows * kIdxTopk * 4, (size_t)R * kIdxTopk * 4, 1,
+                                cudaMemcpyDeviceToHost));
+      std::fwrite(rec.data(), 1, rec.size(), idx_f), std::fflush(idx_f);
+      ++idx_written;
     }
   }
   return o;

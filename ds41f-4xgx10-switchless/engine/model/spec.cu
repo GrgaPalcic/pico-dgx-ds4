@@ -340,6 +340,12 @@ __global__ void k_probe_out(const ops::StepIn* in, const dspark::ProbeOut* p, op
   __threadfence_system();
 }
 
+// DIAGNOSTICS (Options::draft_probe, DSGB10_DRAFT_PROBE): the session's own draft tokens into the probe's path,
+// so that the probe's depth j is the draft for the anchor + 2 + j (draft()'s chain). One thread.
+__global__ void k_probe_path(const int* tok, int* path) {
+  for (int j = 0; j < dspark::kDraft; ++j) path[j] = tok[j];
+}
+
 // The positions of a pass over [a, a + M) that enter the draft module's windows, in ranges in this order:
 // - the 128 before each snapshot inside the pass (from its first row);
 // - its last 256: every slot of the windows, what the main model's ring holds after the chunk. A
@@ -672,6 +678,8 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
   sp.draft = std::make_unique<dspark::Draft>(dw, rank, sp.comm.get(), sp.rope, nunits);
   sp.draft->use_slot(cur_unit);
   if (opt.tree_probe) sp.draft->enable_probe();
+  // DIAGNOSTICS (DSGB10_DRAFT_PROBE): the one-session spec step's probe path (the session's own drafts)
+  if (opt.draft_probe) probe_path = dalloc<int>(dspark::kDraft);
   // stack4: DSGB10_CF_MLP=FILE (dspark::kCfWords fp32 words; the same file on every rank, or the start dies) turns the
   // learned confidence gate of one-session drafts on; DSGB10_CF_DBG=1|2: measurement only (dspark.h enable_cf)
   if (const char* cf = getenv("DSGB10_CF_MLP"); cf && *cf) {
@@ -838,7 +846,12 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   sp.draft->accept(sp.mh, &sp.ss->count, &sp.ss->pos0, st, slot);
   sp.draft->draft(&sp.ss->bonus, st, slot);
   if (opt.tree_probe) {  // EXPERIMENT (docs/engine.md, "Draft trees")
-    sp.draft->probe(in_d->probe, st);
+    const int* path = in_d->probe;
+    if (opt.draft_probe) {  // DIAGNOSTICS (DSGB10_DRAFT_PROBE): the session's own drafts are the path
+      k_probe_path<<<1, 1, 0, st>>>(sp.draft->tokens(), probe_path);
+      path = probe_path;
+    }
+    sp.draft->probe(path, st);
     k_probe_out<<<1, 128, 0, st>>>(in_d, sp.draft->probe_out(), out_h);
   }
   k_spec_next<<<1, 32, 0, st>>>(in_d, sp.ss, sp.draft->tokens(), sp.draft->survival(), out_h, sp.draft->cf_raw());
