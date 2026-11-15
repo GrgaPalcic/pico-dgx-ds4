@@ -4,13 +4,20 @@ An explicit fork of [Picom-code/pico-dgx-ds4](https://github.com/Picom-code/pico
 Shu's [blaesus/dsgb10](https://github.com/blaesus/dsgb10). MIT, as upstream. Everything below this section is
 upstream's README, unchanged except where our changes needed a line.
 
-## What this fork adds
+## What is upstream's, and what this fork adds
 
-- **One shared KV pool** (`--shared-kv`): a live slot reserves 5.9 MiB instead of up to 895.4 MiB at 1M context.
-  Every slot and every stored session takes 3.5 MiB pages from one pool a box; taking a slot or moving a session
-  copies nothing, and a fork shares its parent's pages (copy-on-write).
-- **Sessions that survive a crash**: every finished turn is written through to the NVMe disk tier (`--disk-gib`), so
-  a `kill -9` loses at most the turn in flight.
+Upstream already has the session store, the NVMe disk tier (`--disk-gib`, default 32 GiB) and kept sessions across a
+planned stop. Its [docs/batching.md](ds41f-4xgx10-switchless/docs/batching.md) names the design this fork builds:
+"attention reading the store's pages through a per-session page table: no copies". This fork implements that and adds:
+
+- **One shared KV pool** (`--shared-kv`): every live slot and every stored session takes 3.5 MiB pages from one pool
+  a box, through a per-slot page table. A live slot reserves 5.9 MiB of its own instead of up to 895.4 MiB, so every
+  slot can hold the full 1M context. Taking a slot or moving a session copies nothing, and a fork shares its parent's
+  pages (copy-on-write). The total is not smaller: at our settings the 17 GiB pool takes what upstream's 12 GiB store
+  and its slots (4 × 895.4 + 12 × 116.7 MiB) took together.
+- **Sessions that survive a crash**: upstream keeps sessions only across a planned stop ("A crash keeps nothing",
+  upstream `docs/engine.md`). Here every finished turn is written through to the disk tier, so a `kill -9` loses at
+  most the turn in flight.
 - **A served exactness gate**, `ds41f-4xgx10-switchless/bench/share_gate.py`: concurrent replies against cold replies
   from a fresh engine, a resumed session against a fresh one, forks.
 - **Images**: inline images only, a turn with an image reuses the cached prefix, and an encoder cache for image rows.
@@ -34,16 +41,21 @@ That costs up to ~28 % of aggregate throughput at 16 streams
 The design is [docs/shared-kv.md](ds41f-4xgx10-switchless/docs/shared-kv.md); the measurements, with their windows
 and builds, are [docs/shared-kv-results.md](ds41f-4xgx10-switchless/docs/shared-kv-results.md).
 
-- A live slot reserves 5.9 MiB instead of up to 895.4 MiB (§3.2).
+- A live slot reserves 5.9 MiB instead of up to 895.4 MiB (§3.2); the pool replaces the store and the slots at the
+  same total memory (§3.1).
 - One 17 GiB pool a box: 4,973 pages, 20,369,408 positions (§3.1).
 - The golden reference hashes: 8 of 8 with the flag on and off (§2.1).
 - The served gate: 0 of 5 concurrent replies differ from their cold alone replies; written-through copies cost
-  0.1–0.4 % of decode speed (release notes of [v0.1.0](https://github.com/GrgaPalcic/pico-dgx-ds4/releases/tag/v0.1.0)).
+  0.1–0.4 % of decode speed against the same build with copies off (release notes of
+  [v0.1.0](https://github.com/GrgaPalcic/pico-dgx-ds4/releases/tag/v0.1.0)).
+- Not measured: a full 128 GiB disk tier (how many sessions it holds is arithmetic, ~80 MiB a 32K session), and
+  16 live sessions at 1M at once (§3.2).
 
 ## How it was built
 
-Coding agents wrote most of these changes, several of them running DeepSeek V4.1 Flash on this same 4-Spark
-cluster, inside test windows we designed, reviewed and gated (golden hashes, the serve tests, the share gate).
+The task agents that wrote the code ran DeepSeek V4.1 Flash, served by this same 4-Spark cluster; an orchestrating
+agent reviewed and merged their work and ran the GPU tests, inside test windows we designed and gated (golden hashes,
+the serve tests, the share gate). Commits carry no per-agent attribution.
 
 Note: `#N` issue numbers in the docs refer to our internal tracker.
 
